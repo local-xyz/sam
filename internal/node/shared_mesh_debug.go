@@ -4,7 +4,9 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -138,33 +140,81 @@ func (n *SamNode) renewSharedMeshReservation(ctx context.Context, addr multiaddr
 	}
 }
 
-// DiscoverSharedMeshServices keeps authentication/catalog failures visible to
-// the mobile caller without exposing remote responses or credentials.
-func (n *SamNode) DiscoverSharedMeshServices(ctx context.Context) ([]*api.DiscoveredProvider, error) {
+// SharedMeshDiscoveryFailure contains safe diagnostic codes, never remote error text
+// (which can contain credentials, URLs, or backend responses).
+type SharedMeshDiscoveryFailure struct {
+	PeerID      string `json:"peerId"`
+	ServiceName string `json:"serviceName,omitempty"`
+	Stage       string `json:"stage"`
+	Reason      string `json:"reason"`
+}
+
+type SharedMeshServiceDiscovery struct {
+	Providers []*api.DiscoveredProvider
+	Failures  []SharedMeshDiscoveryFailure
+}
+
+// SharedMeshConnectionAdmission lets a debug integration pace authenticated
+// stream creation without changing the server's security limits.
+type SharedMeshConnectionAdmission func(context.Context, peer.ID) error
+
+func SharedMeshFailure(id peer.ID, service, stage string, err error) SharedMeshDiscoveryFailure {
+	reason := "unavailable"
+	var timedOut net.Error
+	switch {
+	case errors.Is(err, ErrAuthRejected):
+		reason = "authentication_rejected"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &timedOut) && timedOut.Timeout():
+		reason = "timeout"
+	case errors.Is(err, network.ErrReset):
+		reason = "stream_reset"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		reason = "connection_closed"
+	}
+	return SharedMeshDiscoveryFailure{PeerID: id.String(), ServiceName: service, Stage: stage, Reason: reason}
+}
+
+// DiscoverSharedMeshServices preserves each unreachable provider even when another
+// provider succeeds. Absence of a tool is not evidence that its catalog was queried.
+func (n *SamNode) DiscoverSharedMeshServices(ctx context.Context, admit SharedMeshConnectionAdmission) (SharedMeshServiceDiscovery, error) {
+	result := SharedMeshServiceDiscovery{Providers: []*api.DiscoveredProvider{}, Failures: []SharedMeshDiscoveryFailure{}}
 	peers, err := n.FindProvidersByType(ctx, api.ServiceType_SERVICE_TYPE_MCP)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	result := []*api.DiscoveredProvider{}
-	failed := 0
 	for _, p := range peers {
 		if p.ID == n.Host.ID() {
 			continue
 		}
+		if admit != nil {
+			if err := admit(ctx, p.ID); err != nil {
+				result.Failures = append(result.Failures, SharedMeshFailure(p.ID, "", "service_catalog", err))
+				continue
+			}
+		}
 		services, err := n.fetchRemoteServiceCatalog(ctx, p.ID, "mcp")
 		if err != nil {
-			failed++
+			result.Failures = append(result.Failures, SharedMeshFailure(p.ID, "", "service_catalog", err))
 			continue
 		}
 		for _, svc := range services {
-			result = append(result, &api.DiscoveredProvider{PeerId: p.ID.String(), SrvName: svc.Name, SrvDescription: svc.Description})
+			result.Providers = append(result.Providers, &api.DiscoveredProvider{PeerId: p.ID.String(), SrvName: svc.Name, SrvDescription: svc.Description})
 		}
 	}
 	if ctx.Err() != nil {
-		return nil, fmt.Errorf("mesh discovery: %d provider catalogs failed before operation ended: %w", failed, ctx.Err())
-	}
-	if len(result) == 0 && failed > 0 {
-		return nil, fmt.Errorf("mesh discovery: %d providers found but their authenticated catalogs were unreachable", failed)
+		return result, ctx.Err()
 	}
 	return result, nil
+}
+
+// CallSharedMeshToolOnce performs one paced call attempt. Transport failures are
+// returned as uncertain outcomes and are never retried by this debug boundary.
+func (n *SamNode) CallSharedMeshToolOnce(ctx context.Context, target peer.ID, toolName string, arguments any, admit SharedMeshConnectionAdmission) (*mcp.CallToolResult, error) {
+	n.preparePeerAddrs(ctx, target)
+	if admit != nil {
+		if err := admit(ctx, target); err != nil {
+			return nil, err
+		}
+	}
+	return n.callMCPToolOnce(ctx, target, toolName, arguments, nil)
 }

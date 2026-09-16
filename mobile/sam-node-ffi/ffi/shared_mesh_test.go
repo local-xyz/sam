@@ -76,9 +76,11 @@ func TestSharedMeshDiscoveryCallRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer alice.close()
+	var discovery SharedMeshDiscovery
 	var discovered []SharedMeshTool
 	for ctx.Err() == nil {
-		discovered, err = alice.discover(ctx)
+		discovery, err = alice.discover(ctx)
+		discovered = discovery.Tools
 		if err == nil && len(discovered) > 0 {
 			break
 		}

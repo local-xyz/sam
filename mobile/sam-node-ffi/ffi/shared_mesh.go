@@ -19,10 +19,12 @@ import (
 	"github.com/google/sam/api"
 	"github.com/google/sam/internal/identity"
 	"github.com/google/sam/internal/node"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/multiformats/go-multiaddr"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,13 +52,15 @@ type SharedMeshCall struct {
 	Arguments map[string]any `json:"arguments"`
 }
 type sharedMesh struct {
-	node      *node.SamNode
-	store     *node.Store
-	ctx       context.Context
-	cancel    context.CancelFunc
-	published bool
-	once      sync.Once
-	closeErr  error
+	node        *node.SamNode
+	store       *node.Store
+	ctx         context.Context
+	cancel      context.CancelFunc
+	published   bool
+	once        sync.Once
+	closeErr    error
+	admissionMu sync.Mutex
+	admission   *lru.Cache[peer.ID, *rate.Limiter]
 }
 
 var activeSharedMesh *sharedMesh
@@ -186,7 +190,11 @@ func newSharedMesh(parent context.Context, cfg SharedMeshConfig) (r *sharedMesh,
 	if err = instance.ReserveSharedMeshRouters(parent, ctx); err != nil {
 		return nil, err
 	}
-	r = &sharedMesh{node: instance, store: store, ctx: ctx, cancel: cancel}
+	admission, err := lru.New[peer.ID, *rate.Limiter](node.RateLimiterSize)
+	if err != nil {
+		return nil, fmt.Errorf("create connection admission cache: %w", err)
+	}
+	r = &sharedMesh{node: instance, store: store, ctx: ctx, cancel: cancel, admission: admission}
 	if cfg.BackendURL != "" {
 		if err = instance.RegisterSharedMeshBackend(parent, sharedMeshService, cfg.DisplayName, cfg.BackendURL, cfg.BackendToken); err != nil {
 			return nil, err
@@ -202,41 +210,77 @@ func (r *sharedMesh) close() error {
 	r.once.Do(func() { r.cancel(); r.closeErr = errors.Join(r.node.Teardown(), r.store.Close()) })
 	return r.closeErr
 }
-func (r *sharedMesh) discover(ctx context.Context) ([]SharedMeshTool, error) {
-	providers, err := r.node.DiscoverSharedMeshServices(ctx)
-	if err != nil {
-		return nil, err
+
+func (r *sharedMesh) admitConnection(ctx context.Context, target peer.ID) error {
+	return r.connectionLimiter(target).Wait(ctx)
+}
+
+func (r *sharedMesh) connectionLimiter(target peer.ID) *rate.Limiter {
+	r.admissionMu.Lock()
+	defer r.admissionMu.Unlock()
+	limiter, ok := r.admission.Get(target)
+	if !ok {
+		// Keep a safety margin below the server's exported per-peer rate. A
+		// burst of one prevents this integration from consuming the remote
+		// peer's entire security burst before unrelated traffic is counted.
+		limiter = rate.NewLimiter(rate.Limit(node.PeerRateLimit)*0.8, 1)
+		r.admission.Add(target, limiter)
 	}
-	result := []SharedMeshTool{}
-	failed := 0
-	for _, p := range providers {
-		if p.PeerId == r.node.Host.ID().String() {
-			continue
-		}
+	return limiter
+}
+
+// SharedMeshDiscovery is a complete report of this attempt, including partial failures.
+type SharedMeshDiscovery struct {
+	Tools    []SharedMeshTool                  `json:"tools"`
+	Failures []node.SharedMeshDiscoveryFailure `json:"failures"`
+}
+
+func (r *sharedMesh) discover(ctx context.Context) (SharedMeshDiscovery, error) {
+	services, err := r.node.DiscoverSharedMeshServices(ctx, r.admitConnection)
+	if err != nil {
+		return SharedMeshDiscovery{}, err
+	}
+	return collectSharedMeshTools(ctx, services, func(ctx context.Context, p *api.DiscoveredProvider) ([]*mcp.Tool, string, error) {
 		id, err := peer.Decode(p.PeerId)
 		if err != nil {
-			continue
+			return nil, "connect", err
+		}
+		if err := r.admitConnection(ctx, id); err != nil {
+			return nil, "connect", err
 		}
 		session, cleanup, err := r.node.ConnectMCPSession(ctx, id, "mcp://"+p.SrvName, nil)
 		if err != nil {
-			failed++
-			continue
+			return nil, "connect", err
 		}
+		defer cleanup()
 		tools, err := session.ListTools(ctx, nil)
-		cleanup()
 		if err != nil {
-			failed++
+			return nil, "tools_list", err
+		}
+		return tools.Tools, "", nil
+	})
+}
+
+func collectSharedMeshTools(ctx context.Context, services node.SharedMeshServiceDiscovery,
+	list func(context.Context, *api.DiscoveredProvider) ([]*mcp.Tool, string, error),
+) (SharedMeshDiscovery, error) {
+	result := SharedMeshDiscovery{Tools: []SharedMeshTool{}, Failures: append([]node.SharedMeshDiscoveryFailure{}, services.Failures...)}
+	for _, p := range services.Providers {
+		tools, stage, err := list(ctx, p)
+		if err != nil {
+			id, decodeErr := peer.Decode(p.PeerId)
+			if decodeErr != nil {
+				return result, errors.New("invalid discovered peer identity")
+			}
+			result.Failures = append(result.Failures, node.SharedMeshFailure(id, p.SrvName, stage, err))
 			continue
 		}
-		for _, t := range tools.Tools {
-			result = append(result, SharedMeshTool{PeerID: p.PeerId, ServiceName: p.SrvName, ToolName: "mcp://" + p.SrvName + "/" + t.Name, Description: t.Description + " (" + p.SrvDescription + ")", InputSchema: t.InputSchema})
+		for _, t := range tools {
+			result.Tools = append(result.Tools, SharedMeshTool{PeerID: p.PeerId, ServiceName: p.SrvName, ToolName: "mcp://" + p.SrvName + "/" + t.Name, Description: t.Description + " (" + p.SrvDescription + ")", InputSchema: t.InputSchema})
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if len(result) == 0 && failed > 0 {
-		return nil, fmt.Errorf("mesh discovery: %d published services failed authenticated tool listing", failed)
+	if ctx.Err() != nil {
+		return result, ctx.Err()
 	}
 	return result, nil
 }
@@ -245,7 +289,7 @@ func (r *sharedMesh) call(ctx context.Context, c SharedMeshCall) (*mcp.CallToolR
 	if err != nil {
 		return nil, errors.New("invalid peerId")
 	}
-	return r.node.CallMCPTool(ctx, id, c.ToolName, c.Arguments, nil)
+	return r.node.CallSharedMeshToolOnce(ctx, id, c.ToolName, c.Arguments, r.admitConnection)
 }
 func StartSharedMesh(configJSON string) error {
 	var cfg SharedMeshConfig
