@@ -358,3 +358,93 @@ func TestServiceRegistry_BackendProbeTimeoutIsConfigurable(t *testing.T) {
 		}
 	})
 }
+
+func TestServiceRegistry_RegisterRejectsDuplicateNameWithoutDisplacing(t *testing.T) {
+	dht := &fakeDHT{}
+	r := newServiceRegistryForTest(dht)
+
+	first := newFakeSvc("shared", api.ServiceType_SERVICE_TYPE_MCP)
+	if err := r.Register(context.Background(), first); err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+
+	// A duplicate under the same name must be rejected — same type or not —
+	// before its Init runs, and the live service must stay routable.
+	for _, dup := range []*fakeService{
+		newFakeSvc("shared", api.ServiceType_SERVICE_TYPE_MCP),
+		newFakeSvc("shared", api.ServiceType_SERVICE_TYPE_A2A),
+	} {
+		if err := r.Register(context.Background(), dup); err == nil {
+			t.Fatalf("Register duplicate %s: want error, got nil", dup.info.Type)
+		}
+		if dup.initCalls != 0 {
+			t.Errorf("duplicate %s: Init called %d times, want 0", dup.info.Type, dup.initCalls)
+		}
+	}
+	if first.teardownCalls != 0 {
+		t.Errorf("existing service torn down %d times by rejected duplicates, want 0", first.teardownCalls)
+	}
+	got, ok := r.Get("shared")
+	if !ok || got != Service(first) {
+		t.Fatal("existing service displaced by rejected duplicate")
+	}
+
+	// After an explicit Unregister the name is free again.
+	if err := r.Unregister(context.Background(), "shared"); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	replacement := newFakeSvc("shared", api.ServiceType_SERVICE_TYPE_A2A)
+	if err := r.Register(context.Background(), replacement); err != nil {
+		t.Fatalf("Register after Unregister: %v", err)
+	}
+}
+
+func TestServiceRegistry_ConcurrentRegisterSameNameHasOneWinner(t *testing.T) {
+	r := newServiceRegistryForTest(&fakeDHT{})
+
+	const contenders = 8
+	svcs := make([]*fakeService, contenders)
+	errs := make([]error, contenders)
+	var wg sync.WaitGroup
+	for i := 0; i < contenders; i++ {
+		i := i
+		svcs[i] = newFakeSvc("contested", api.ServiceType_SERVICE_TYPE_MCP)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = r.Register(context.Background(), svcs[i])
+		}()
+	}
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		if err == nil {
+			winners++
+			if got, ok := r.Get("contested"); !ok || got != Service(svcs[i]) {
+				t.Errorf("winner %d is not the registered service", i)
+			}
+		} else if svcs[i].initCalls != 0 {
+			t.Errorf("loser %d: Init called %d times, want 0", i, svcs[i].initCalls)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("got %d successful registrations for one name, want exactly 1", winners)
+	}
+}
+
+func TestServiceRegistry_RegisterFailureFreesReservedName(t *testing.T) {
+	r := newServiceRegistryForTest(&fakeDHT{})
+
+	failing := newFakeSvc("retry", api.ServiceType_SERVICE_TYPE_MCP)
+	failing.initErr = errors.New("init failed")
+	if err := r.Register(context.Background(), failing); err == nil {
+		t.Fatal("expected Init failure to fail Register")
+	}
+
+	// The failed attempt must not leave the name reserved forever.
+	ok := newFakeSvc("retry", api.ServiceType_SERVICE_TYPE_MCP)
+	if err := r.Register(context.Background(), ok); err != nil {
+		t.Fatalf("Register after failed attempt: %v", err)
+	}
+}

@@ -27,6 +27,16 @@ func (n *SamNode) RegisterSharedMeshA2ABackend(ctx context.Context, name, displa
 		net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback() || token == "" {
 		return fmt.Errorf("backend requires an HTTP loopback IP URL and token")
 	}
+	// An identical re-publish is a retry, not a conflict: the registry
+	// rejects duplicate names rather than replacing the live service, so
+	// answer it with the success the caller missed. Anything else registered
+	// under the name (another type, another backend) is a real conflict and
+	// falls through to the registry's rejection.
+	if existing, ok := n.services.Get(name); ok {
+		if prior, isA2A := existing.(*sharedMeshA2AService); isA2A && prior.endpoint == endpoint && prior.token == token {
+			return nil
+		}
+	}
 	svc := &sharedMeshA2AService{
 		A2AService: A2AService{baseService: baseService{
 			info:    &api.ServiceInfo{Name: name, Type: api.ServiceType_SERVICE_TYPE_A2A, Description: "A2A agent of " + displayName},

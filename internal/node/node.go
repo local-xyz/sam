@@ -2077,6 +2077,14 @@ func (n *SamNode) StartIngressServer(ctx context.Context) error {
 				http.Error(w, "Service not found", http.StatusNotFound)
 				return
 			}
+			// The registry is name-keyed; a request whose type segment does
+			// not match the registered service must not reach that service's
+			// backend under the wrong protocol.
+			if svc.Info().GetType() != serviceType {
+				logger.Warnf("[Ingress] Service %s is %s, not %s", serviceName, svc.Info().GetType(), serviceType)
+				http.Error(w, "Service not found", http.StatusNotFound)
+				return
+			}
 			if svc.Handler() == nil {
 				logger.Errorf("[Ingress] Service %s has nil handler", serviceName)
 				http.Error(w, "Service not found", http.StatusNotFound)

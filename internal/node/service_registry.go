@@ -70,7 +70,13 @@ func advertisable(ctx context.Context, svc Service, probeTimeout time.Duration) 
 type ServiceRegistry struct {
 	mu       sync.RWMutex
 	services map[string]Service
-	dht      dhtProvider
+
+	// reserved holds names whose Register is in flight (Init/Provide running
+	// outside the lock), so two concurrent Registers cannot both win the same
+	// name. Lazily initialized under mu.
+	reserved map[string]struct{}
+
+	dht dhtProvider
 
 	// reprovideNow asks the node to run a reprovide cycle now, so a service
 	// registered after the loop last ran does not wait a whole interval to be
@@ -99,9 +105,43 @@ func NewServiceRegistry(d dhtProvider, backendProbeTimeout time.Duration) *Servi
 	}
 }
 
+// reserveName claims name for an in-flight Register. Names are the routing
+// key for ingress, so a second registration under a live name must be
+// rejected, never silently replace the first: an overwrite would hand the
+// displaced service's traffic to the newcomer (across types, since routing is
+// name-keyed) and leak its Init-owned resources without Teardown.
+func (r *ServiceRegistry) reserveName(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.services[name]; ok {
+		return fmt.Errorf("service %q is already registered as %s; unregister it first", name, existing.Info().GetType())
+	}
+	if _, ok := r.reserved[name]; ok {
+		return fmt.Errorf("service %q registration is already in progress", name)
+	}
+	if r.reserved == nil {
+		r.reserved = map[string]struct{}{}
+	}
+	r.reserved[name] = struct{}{}
+	return nil
+}
+
+// releaseName ends an in-flight Register, inserting svc when it succeeded
+// (svc non-nil) and freeing the name otherwise.
+func (r *ServiceRegistry) releaseName(name string, svc Service) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.reserved, name)
+	if svc != nil {
+		r.services[name] = svc
+	}
+}
+
 // Register initialises a service, advertises it on the DHT, and inserts it
 // into the map. Init runs before Provide so a failed handler-build never
-// briefly advertises an unservable name.
+// briefly advertises an unservable name. A name that is already registered
+// (or mid-registration) is rejected before Init runs; the existing service
+// is never displaced.
 //
 // A backend that does not answer is registered but not advertised, rather than
 // rejected: backends routinely start after the node does, and the reprovide
@@ -111,6 +151,16 @@ func (r *ServiceRegistry) Register(ctx context.Context, svc Service) error {
 	if info.Type == api.ServiceType_SERVICE_TYPE_UNSPECIFIED {
 		return fmt.Errorf("cannot register service with unspecified type")
 	}
+
+	if err := r.reserveName(info.Name); err != nil {
+		return err
+	}
+	registered := false
+	defer func() {
+		if !registered {
+			r.releaseName(info.Name, nil)
+		}
+	}()
 
 	if err := svc.Init(ctx); err != nil {
 		return fmt.Errorf("init %s: %w", info.Name, err)
@@ -142,9 +192,8 @@ func (r *ServiceRegistry) Register(ctx context.Context, svc Service) error {
 		}
 	}
 
-	r.mu.Lock()
-	r.services[info.Name] = svc
-	r.mu.Unlock()
+	r.releaseName(info.Name, svc)
+	registered = true
 
 	if probeErr == nil {
 		logger.Infof("[ServiceRegistry] Registered %s/%s (name CID: %s, type CID: %s)", info.Type, info.Name, srvNameCID, srvTypeCID)
