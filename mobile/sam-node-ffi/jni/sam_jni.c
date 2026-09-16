@@ -111,6 +111,18 @@ JNIEXPORT jbyteArray JNICALL
 Java_com_example_appfunctions_agent_sam_SamMeshNative_call(JNIEnv *env, jobject receiver, jbyteArray input) {
     (void)receiver; return mesh_json_call(env, input, CallSharedMeshTool);
 }
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_appfunctions_agent_sam_SamA2aNative_publish(JNIEnv *env, jobject receiver, jbyteArray input) {
+    (void)receiver; return mesh_json_call(env, input, PublishSharedMeshA2AService);
+}
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_appfunctions_agent_sam_SamA2aNative_gateway(JNIEnv *env, jobject receiver) {
+    (void)receiver; return copy_and_free(env, StartSharedMeshA2AGateway());
+}
+JNIEXPORT jbyteArray JNICALL
+Java_com_example_appfunctions_agent_sam_SamA2aNative_discover(JNIEnv *env, jobject receiver) {
+    (void)receiver; return copy_and_free(env, DiscoverSharedMeshA2AServices());
+}
 
 #endif
 
