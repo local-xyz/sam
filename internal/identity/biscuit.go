@@ -91,9 +91,8 @@ func RequireAuthorityBinding(b *biscuit.Biscuit, expectedPeer peer.ID) error {
 	return nil
 }
 
-// ExpirationOf reports the expiration() fact of an already-authorized token, for
-// callers that cache an admission decision and must later know when it lapses.
-func ExpirationOf(authorizer biscuit.Authorizer) (time.Time, error) {
+// expirationOf reports the expiration() fact of an already-authorized token.
+func expirationOf(authorizer biscuit.Authorizer) (time.Time, error) {
 	facts, err := authorizer.Query(biscuit.Rule{
 		Head: biscuit.Predicate{Name: "get_exp", IDs: []biscuit.Term{biscuit.Variable("e")}},
 		Body: []biscuit.Predicate{{Name: api.FactExpiration, IDs: []biscuit.Term{biscuit.Variable("e")}}},
@@ -325,33 +324,47 @@ func mintBiscuit(signingKey ed25519.PrivateKey, remotePeer peer.ID, roles []stri
 // 2. The token is not expired.
 // 3. The token is securely bound to the expected remotePeer.
 func VerifyBiscuit(biscuitData []byte, expectedPeer peer.ID, trustedPublicKeys []ed25519.PublicKey, timeout time.Duration) (*biscuit.Biscuit, error) {
-	b, _, err := VerifyBiscuitAndGetKey(biscuitData, expectedPeer, trustedPublicKeys, timeout)
+	b, _, _, err := verifyBiscuit(biscuitData, expectedPeer, trustedPublicKeys, timeout)
 	return b, err
 }
 
+// VerifyBiscuitAndGetKey is VerifyBiscuit that also reports which trusted key
+// verified the token, for callers that go on to evaluate it under that key.
 func VerifyBiscuitAndGetKey(biscuitData []byte, expectedPeer peer.ID, trustedPublicKeys []ed25519.PublicKey, timeout time.Duration) (*biscuit.Biscuit, ed25519.PublicKey, error) {
+	b, key, _, err := verifyBiscuit(biscuitData, expectedPeer, trustedPublicKeys, timeout)
+	return b, key, err
+}
+
+// VerifyBiscuitAndGetExpiry is VerifyBiscuit that also reports when the token
+// lapses, for callers that cache the admission and must drop it on time.
+func VerifyBiscuitAndGetExpiry(biscuitData []byte, expectedPeer peer.ID, trustedPublicKeys []ed25519.PublicKey, timeout time.Duration) (time.Time, error) {
+	_, _, expiry, err := verifyBiscuit(biscuitData, expectedPeer, trustedPublicKeys, timeout)
+	return expiry, err
+}
+
+func verifyBiscuit(biscuitData []byte, expectedPeer peer.ID, trustedPublicKeys []ed25519.PublicKey, timeout time.Duration) (*biscuit.Biscuit, ed25519.PublicKey, time.Time, error) {
 	b, err := biscuit.Unmarshal(biscuitData)
 	if err != nil {
-		return nil, nil, fmt.Errorf("malformed biscuit: %w", err)
+		return nil, nil, time.Time{}, fmt.Errorf("malformed biscuit: %w", err)
 	}
 
 	authOpts := AuthorizerOptions(timeout)
 
 	var lastErr error
-	var authorized bool
+	var authorizer biscuit.Authorizer
 	var verifyingKey ed25519.PublicKey
 	for _, pubKey := range trustedPublicKeys {
-		authorizer, err := b.Authorizer(pubKey, authOpts...)
+		candidate, err := b.Authorizer(pubKey, authOpts...)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 
-		EnforceExpiration(authorizer)
-		authorizer.AddPolicy(api.AllowIfTruePolicy)
+		EnforceExpiration(candidate)
+		candidate.AddPolicy(api.AllowIfTruePolicy)
 
-		if err := authorizer.Authorize(); err == nil {
-			authorized = true
+		if err := candidate.Authorize(); err == nil {
+			authorizer = candidate
 			verifyingKey = pubKey
 			break
 		} else {
@@ -359,15 +372,22 @@ func VerifyBiscuitAndGetKey(biscuitData []byte, expectedPeer peer.ID, trustedPub
 		}
 	}
 
-	if !authorized {
-		return nil, nil, fmt.Errorf("no valid key found for verification: %v", lastErr)
+	if authorizer == nil {
+		return nil, nil, time.Time{}, fmt.Errorf("no valid key found for verification: %v", lastErr)
 	}
 
 	if err := RequireAuthorityBinding(b, expectedPeer); err != nil {
-		return nil, nil, err
+		return nil, nil, time.Time{}, err
 	}
 
-	return b, verifyingKey, nil
+	// EnforceExpiration already passed, so the fact is there; a failure here is
+	// a query error, and fails closed rather than caching an admission forever.
+	expiry, err := expirationOf(authorizer)
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+
+	return b, verifyingKey, expiry, nil
 }
 
 func translateClaimsToFacts(addFact func(biscuit.Fact) error, claims map[string]any) error {
@@ -487,18 +507,16 @@ func extractPeerID(trustedPublicKeys []ed25519.PublicKey, biscuitData []byte, ti
 	}
 
 	// Extract the peer ID using Datalog query
-	peerRule, err := parser.FromStringRule(`get_peer($p) <- node($p)`)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse query rule: %w", err)
-	}
-
-	facts, err := authorizer.Query(peerRule)
+	facts, err := authorizer.Query(biscuit.Rule{
+		Head: biscuit.Predicate{Name: "get_peer", IDs: []biscuit.Term{biscuit.Variable("p")}},
+		Body: []biscuit.Predicate{{Name: api.FactNode, IDs: []biscuit.Term{biscuit.Variable("p")}}},
+	})
 	if err != nil {
 		return "", fmt.Errorf("query failed: %w", err)
 	}
 
 	if len(facts) == 0 {
-		return "", fmt.Errorf("no node fact found in biscuit. Authorizer state: %s", authorizer.PrintWorld())
+		return "", fmt.Errorf("no %s fact found in biscuit. Authorizer state: %s", api.FactNode, authorizer.PrintWorld())
 	}
 
 	// Extract value from fact
@@ -531,8 +549,15 @@ func VerifyBiscuitRole(biscuitData []byte, controlPlanePubKey ed25519.PublicKey,
 	if err != nil {
 		return fmt.Errorf("malformed biscuit: %w", err)
 	}
+	return RequireRole(b, controlPlanePubKey, expectedRole, timeout)
+}
 
-	authorizer, err := b.Authorizer(controlPlanePubKey, AuthorizerOptions(timeout)...)
+// RequireRole checks that the token carries role(expectedRole) under the given
+// key. It checks nothing else: a token received from a peer must already have
+// passed VerifyBiscuitAndGetKey, which is where expiry and the peer binding are
+// enforced, and key must be the key that verified it.
+func RequireRole(b *biscuit.Biscuit, key ed25519.PublicKey, expectedRole string, timeout time.Duration) error {
+	authorizer, err := b.Authorizer(key, AuthorizerOptions(timeout)...)
 	if err != nil {
 		return fmt.Errorf("failed to create authorizer: %w", err)
 	}

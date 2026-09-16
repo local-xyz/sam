@@ -618,7 +618,6 @@ machinery, because the existing vocabulary is already shaped for it:
 `agent` a first-class principal is:
 
 * `FactAgent = "agent"` in `api/datalog.go`;
-* `FactAgent` added to `ValidMemberPrefixes` in `api/policy.go`;
 * the agent block's `agent(...)` fact injected as a `target_fact` at
   authorization time.
 
@@ -716,7 +715,7 @@ blocks in `biscuit-go` to be attributable. It is a clean upgrade, not a rewrite.
 
 ### 8.7 Consequences for the plan
 
-* `api/` — `FactAgent`, `ValidMemberPrefixes`, the §8.8 translation helpers, and
+* `api/` — `FactAgent`, the §8.8 translation helpers, and
   the §10 bundle schema.
 * `internal/node` — **nothing** for authorization: appended blocks are already
   verified and evaluated. Only the namespace-binding policy is new.

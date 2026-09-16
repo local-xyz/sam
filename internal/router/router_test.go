@@ -805,10 +805,12 @@ func TestRouterDefaultBiscuitTimeout(t *testing.T) {
 	}
 }
 
-// TestPerformMutualAuthAcceptsRotatedKey covers the key rotation window: the
-// remote biscuit is signed by the second trusted key, so the role authorizer
-// must be built from the key that actually verified, not trustedKeys[0].
-func TestPerformMutualAuthAcceptsRotatedKey(t *testing.T) {
+// TestPerformMutualAuth covers the two decisions the client side makes about
+// the remote biscuit. Rotated key: the biscuit is signed by the second trusted
+// key, so the role check must run under the key that verified, not
+// trustedKeys[0]. Missing role: a valid biscuit that lacks the required role
+// is refused and the peer is not recorded.
+func TestPerformMutualAuth(t *testing.T) {
 	oldPub, _, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -818,59 +820,84 @@ func TestPerformMutualAuthAcceptsRotatedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	serverHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = serverHost.Close() }()
+	for _, tt := range []struct {
+		name       string
+		serverRole string
+		wantOK     bool
+	}{
+		{"rotated key", api.RoleRouter, true},
+		{"missing role", api.RoleNode, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			serverHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = serverHost.Close() }()
 
-	clientHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = clientHost.Close() }()
+			clientHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = clientHost.Close() }()
 
-	serverBiscuit, err := identity.MintBootstrapBiscuitToken(newPriv, serverHost.ID(), api.RoleRouter, time.Now().Add(time.Hour), nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+			serverBiscuit, err := identity.MintBootstrapBiscuitToken(newPriv, serverHost.ID(), tt.serverRole, time.Now().Add(time.Hour), nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-	serverHost.SetStreamHandler(api.AuthProtocolID, func(s network.Stream) {
-		defer func() { _ = s.Close() }()
-		reader := msgio.NewVarintReaderSize(s, 1024*64)
-		msg, err := reader.ReadMsg()
-		if err != nil {
-			return
-		}
-		reader.ReleaseMsg(msg)
-		respBytes, _ := proto.Marshal(&api.AuthResponse{Success: true, Biscuit: serverBiscuit})
-		_ = msgio.NewVarintWriter(s).WriteMsg(respBytes)
-	})
+			serverHost.SetStreamHandler(api.AuthProtocolID, func(s network.Stream) {
+				defer func() { _ = s.Close() }()
+				reader := msgio.NewVarintReaderSize(s, 1024*64)
+				msg, err := reader.ReadMsg()
+				if err != nil {
+					return
+				}
+				reader.ReleaseMsg(msg)
+				respBytes, err := proto.Marshal(&api.AuthResponse{Success: true, Biscuit: serverBiscuit})
+				if err != nil {
+					return
+				}
+				_ = msgio.NewVarintWriter(s).WriteMsg(respBytes)
+			})
 
-	r := &Router{
-		Host:              clientHost,
-		biscuitToken:      []byte("client-biscuit"),
-		trustedPublicKeys: []ed25519.PublicKey{oldPub, newPub},
-		config: Options{
-			BiscuitTimeout: time.Second,
-			RequiredRole:   api.RoleRouter,
-		},
-	}
+			r := &Router{
+				Host:              clientHost,
+				biscuitToken:      []byte("client-biscuit"),
+				trustedPublicKeys: []ed25519.PublicKey{oldPub, newPub},
+				config: Options{
+					BiscuitTimeout: time.Second,
+					RequiredRole:   api.RoleRouter,
+				},
+			}
 
-	if err := clientHost.Connect(context.Background(), peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}); err != nil {
-		t.Fatal(err)
-	}
-	s, err := clientHost.NewStream(context.Background(), serverHost.ID(), api.AuthProtocolID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }()
+			if err := clientHost.Connect(context.Background(), peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}); err != nil {
+				t.Fatal(err)
+			}
+			s, err := clientHost.NewStream(context.Background(), serverHost.ID(), api.AuthProtocolID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
 
-	if err := r.performMutualAuth(s); err != nil {
-		t.Fatalf("mutual auth failed with biscuit signed by rotated key: %v", err)
-	}
-	if _, ok := r.authenticatedPeers.Load(serverHost.ID()); !ok {
-		t.Fatal("peer not recorded as authenticated")
+			err = r.performMutualAuth(s)
+			_, recorded := r.authenticatedPeers.Load(serverHost.ID())
+			if tt.wantOK {
+				if err != nil {
+					t.Fatalf("mutual auth failed: %v", err)
+				}
+				if !recorded {
+					t.Fatal("peer not recorded as authenticated")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("peer without the required role accepted")
+			}
+			if recorded {
+				t.Fatal("rejected peer recorded as authenticated")
+			}
+		})
 	}
 }
 

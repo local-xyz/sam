@@ -656,3 +656,111 @@ func TestVerifyBiscuitRole_TimeoutIsHonored(t *testing.T) {
 		t.Errorf("expected datalog timeout error, got %v", err)
 	}
 }
+
+// TestRequireRole covers the role gate every router-only path shares. The
+// appended-block case is the one that matters: appending needs no root key, so
+// a node could otherwise promote itself to router by attenuating its own token.
+func TestRequireRole(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := MintBootstrapBiscuitToken(priv, newTestPeer(t), api.RoleNode, time.Now().Add(time.Hour), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := biscuit.Unmarshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RequireRole(token, pub, api.RoleNode, testTimeout); err != nil {
+		t.Errorf("granted role rejected: %v", err)
+	}
+	if err := RequireRole(token, pub, api.RoleRouter, testTimeout); err == nil {
+		t.Error("missing role accepted")
+	}
+	if err := RequireRole(token, otherPub, api.RoleNode, testTimeout); err == nil {
+		t.Error("token accepted under a key that did not sign it")
+	}
+
+	block := token.CreateBlock()
+	if err := block.AddFact(biscuit.Fact{Predicate: biscuit.Predicate{
+		Name: api.FactRole,
+		IDs:  []biscuit.Term{biscuit.String(api.RoleRouter)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	promoted, err := token.Append(rand.Reader, block.Build())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireRole(promoted, pub, api.RoleRouter, testTimeout); err == nil {
+		t.Error("role from an appended block satisfied the check")
+	}
+}
+
+// TestVerifyBiscuitAndGetExpiry pins the instant the peer-admission cache is
+// keyed on: the token's own expiration, and with several the earliest, since
+// that is the one the expiry check starts failing on.
+func TestVerifyBiscuitAndGetExpiry(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := newTestPeer(t)
+	keys := []ed25519.PublicKey{pub}
+
+	mint := func(expirations ...time.Time) []byte {
+		builder := biscuit.NewBuilder(priv)
+		mustAddAuthorityFact(t, builder, api.FactNode, biscuit.String(peerID.String()))
+		for _, e := range expirations {
+			mustAddAuthorityFact(t, builder, api.FactExpiration, biscuit.Date(e))
+		}
+		token, err := builder.Build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := token.Serialize()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	// Biscuit dates are whole seconds.
+	sameInstant := func(got, want time.Time) bool { return got.Sub(want).Abs() <= time.Second }
+
+	soon := time.Now().Add(time.Hour)
+	later := soon.Add(time.Hour)
+
+	got, err := VerifyBiscuitAndGetExpiry(mint(soon), peerID, keys, testTimeout)
+	if err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+	if !sameInstant(got, soon) {
+		t.Errorf("expiry = %v, want %v", got, soon)
+	}
+
+	got, err = VerifyBiscuitAndGetExpiry(mint(later, soon), peerID, keys, testTimeout)
+	if err != nil {
+		t.Fatalf("token with two expirations rejected: %v", err)
+	}
+	if !sameInstant(got, soon) {
+		t.Errorf("expiry = %v, want the earlier %v", got, soon)
+	}
+
+	if _, err := VerifyBiscuitAndGetExpiry(mint(time.Now().Add(-time.Hour)), peerID, keys, testTimeout); err == nil {
+		t.Error("expired token admitted")
+	}
+	if _, err := VerifyBiscuitAndGetExpiry(mint(), peerID, keys, testTimeout); err == nil {
+		t.Error("token without an expiration admitted")
+	}
+	if _, err := VerifyBiscuitAndGetExpiry(mint(soon), newTestPeer(t), keys, testTimeout); err == nil {
+		t.Error("token bound to another peer admitted")
+	}
+}

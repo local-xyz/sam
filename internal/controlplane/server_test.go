@@ -17,10 +17,12 @@ package controlplane
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -1093,8 +1095,8 @@ func TestBootstrapEnrollmentRequiresProofOfPossession(t *testing.T) {
 	}
 
 	// POST /enroll is gated the same way: the existing-enrollment branch
-	// re-serves the stored biscuit, so a bootstrap token holder who is not
-	// the peer must never reach it.
+	// re-mints a fresh biscuit for the peer, so a bootstrap token holder who
+	// is not the peer must never reach it.
 	postEnroll := func(name string, payload []byte) *api.BootstrapEnrollResponse {
 		t.Helper()
 		resp, err := client.Post(baseURL+"/enroll", "application/x-protobuf", bytes.NewReader(payload))
@@ -1155,8 +1157,18 @@ func TestBootstrapEnrollmentRequiresProofOfPossession(t *testing.T) {
 		ChallengeSignature: retrySig,
 	})
 	r := postEnroll("enrollee retry", retryData)
-	if r.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED || !bytes.Equal(r.BiscuitToken, enrollResp.BiscuitToken) {
-		t.Fatalf("enrollee retry did not return its own biscuit: %v", r.Status)
+	if r.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+		t.Fatalf("enrollee retry did not return APPROVED: %v", r.Status)
+	}
+	if len(r.BiscuitToken) == 0 {
+		t.Fatal("enrollee retry returned an empty biscuit")
+	}
+	// Re-minting is unconditional now (see remintApprovedBootstrapBiscuit), so
+	// the retry gets a freshly minted biscuit rather than the original
+	// byte-for-byte -- it must still verify for the same peer.
+	cpPubKey := ed25519.PublicKey(enrollResp.ControlPlanePublicKey)
+	if _, _, err := identity.VerifyBiscuitAndGetKey(r.BiscuitToken, pID, []ed25519.PublicKey{cpPubKey}, srv.config.BiscuitTimeout); err != nil {
+		t.Fatalf("enrollee retry's biscuit does not verify: %v", err)
 	}
 
 	// Domain separation: a signature captured from one endpoint must verify
@@ -1317,6 +1329,83 @@ func TestRouterLeaseRevocation(t *testing.T) {
 	orphanPeer, orphanBiscuit := enrollLeaseRouter(time.Time{}, true)
 	if got := postLease(orphanPeer, orphanBiscuit); got != http.StatusUnauthorized {
 		t.Fatalf("lease without enrollment record: got %d, want 401", got)
+	}
+}
+
+// TestRouterLeaseUnderRotatedKey covers the rotation grace window on
+// /routers/lease: both keys are valid, the retiring one is listed first, and
+// the biscuit is signed by the new one, so the role check has to run under the
+// key that verified it rather than the first key in the ring.
+func TestRouterLeaseUnderRotatedKey(t *testing.T) {
+	issuer, _ := startCustomMockOIDC(t)
+	srv, store, baseURL := setupTestServer(t, issuer)
+	defer func() {
+		_ = srv.Close()
+		_ = store.Close()
+	}()
+	ctx := context.Background()
+
+	newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RotateKeys(ctx, newPriv, newPub, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	valid, err := store.GetAllValidKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(valid) != 2 || bytes.Equal(valid[0].Public, newPub) {
+		t.Fatalf("keyring is not [retiring, new]: %d keys", len(valid))
+	}
+
+	priv, pub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routerPeer, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubBytes, err := crypto.MarshalPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routerBiscuit, err := identity.MintBootstrapBiscuitToken(newPriv, routerPeer, api.RoleRouter, time.Now().Add(time.Hour), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnrollNode(ctx, &storage.EnrolledNode{
+		PeerID:         routerPeer.String(),
+		PublicKey:      pubBytes,
+		Biscuit:        routerBiscuit,
+		Role:           api.RoleRouter,
+		EnrollmentType: "BOOTSTRAP",
+		EnrolledAt:     time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	leaseData, err := proto.Marshal(&api.RouterLeaseRequest{
+		PeerId:    routerPeer.String(),
+		Addresses: []string{"/ip4/127.0.0.1/tcp/4001/p2p/" + routerPeer.String()},
+		Biscuit:   routerBiscuit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Post(baseURL+"/routers/lease", "application/x-protobuf", bytes.NewReader(leaseData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("lease with biscuit signed by the new key: got %d (%s), want 200", resp.StatusCode, body)
 	}
 }
 
@@ -2765,4 +2854,749 @@ func TestHandleInfoPublishesBanSet(t *testing.T) {
 	if len(after.GetBannedPeerIds()) != 0 {
 		t.Errorf("after unban banned_peer_ids = %v, want empty", after.GetBannedPeerIds())
 	}
+}
+
+// createAdminBootstrapToken creates a bootstrap token for role via the admin
+// API and returns the plaintext token string.
+func createAdminBootstrapToken(t *testing.T, baseURL, adminToken, role string, maxUsages int) string {
+	t.Helper()
+	body := fmt.Sprintf(`{"role":%q,"ttl_hours":2,"max_usages":%d,"description":"re-enroll test"}`, role, maxUsages)
+	return createAdminBootstrapTokenJSON(t, baseURL, adminToken, body)
+}
+
+// createAdminBootstrapTokenJSON posts body verbatim to /admin/bootstrap-tokens
+// and returns the plaintext token string.
+func createAdminBootstrapTokenJSON(t *testing.T, baseURL, adminToken, body string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/admin/bootstrap-tokens", bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("failed to create bootstrap token: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var tokenDetails struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&tokenDetails)
+	if tokenDetails.Token == "" {
+		t.Fatal("empty bootstrap token")
+	}
+	return tokenDetails.Token
+}
+
+// bootstrapEnroll drives POST /enroll for peer priv/pID with the given
+// bootstrap token, requested role and labels, and returns the decoded
+// response. A REJECTED status is still HTTP 200 (see writeEnrollError), so
+// callers check the response's own Status field, not just the transport
+// status.
+func bootstrapEnroll(t *testing.T, baseURL, token string, priv crypto.PrivKey, pID peer.ID, pubBytes []byte, role string, labels map[string]string) *api.BootstrapEnrollResponse {
+	t.Helper()
+	ts, sig := enrollPoP(t, priv, pID.String())
+	data, err := proto.Marshal(&api.BootstrapEnrollRequest{
+		BootstrapToken:     token,
+		PeerId:             pID.String(),
+		PublicKey:          pubBytes,
+		RequestedRole:      role,
+		Labels:             labels,
+		Timestamp:          ts,
+		ChallengeSignature: sig,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Post(baseURL+"/enroll", "application/x-protobuf", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("/enroll failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/enroll status %s: %s", resp.Status, string(body))
+	}
+	var out api.BootstrapEnrollResponse
+	if err := proto.Unmarshal(body, &out); err != nil {
+		t.Fatalf("unmarshal BootstrapEnrollResponse: %v", err)
+	}
+	return &out
+}
+
+// TestReEnrollAfterExpiryMintsFreshBiscuit pins the fix for the bootstrap
+// enrollment stale-biscuit-replay bug, and the follow-up hardening requested
+// in review: re-minting must be unconditional rather than gated by how stale
+// the stored token looks, must never happen on the /enroll/status poll
+// (which has no ban check and no live-token requirement), must ignore
+// whatever role or labels a re-enroll request itself declares in favor of
+// the enrolled node record, and must refuse a peer that is no longer
+// admitted.
+//
+// Before the original fix, both /enroll's existing-request branch and
+// /enroll/status returned existingReq.BiscuitToken verbatim forever, so a
+// router hitting a 401 on lease renewal and re-enrolling would receive the
+// exact same expired token every time -- an unbreakable enroll -> reject ->
+// re-enroll loop, identical to the one HandleRouterLease logs as "failed
+// biscuit verification: ... $time <= $exp".
+func TestReEnrollAfterExpiryMintsFreshBiscuit(t *testing.T) {
+	issuer, _ := startCustomMockOIDC(t)
+	const adminToken = "super-secret-admin-token"
+
+	// start spins up a fresh server and a fresh bootstrap token, so no
+	// subtest's enrollment state can leak into another's.
+	start := func(t *testing.T, role string, maxUsages int) (*Server, storage.Store, string, string) {
+		t.Helper()
+		srv, store, baseURL := setupTestServer(t, issuer)
+		t.Cleanup(func() {
+			_ = srv.Close()
+			_ = store.Close()
+		})
+		srv.config.AdminToken = adminToken
+		srv.config.AutoApproveEnrollment = true
+		// Auto-approve still runs declared labels through LabelPatternsAllow;
+		// without a policy granting role, that always rejects a non-empty
+		// label set, so the label-mutation subtest would never get an
+		// enrolled node to check in the first place.
+		if err := store.SaveMeshPolicy(context.Background(), []*api.PolicyRole{
+			{Name: role, AllowedLabels: []string{"*"}},
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+		token := createAdminBootstrapToken(t, baseURL, adminToken, role, maxUsages)
+		return srv, store, baseURL, token
+	}
+
+	newPeer := func(t *testing.T) (crypto.PrivKey, peer.ID, []byte) {
+		t.Helper()
+		priv, pub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pID, err := peer.IDFromPrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pubBytes, err := crypto.MarshalPublicKey(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return priv, pID, pubBytes
+	}
+
+	t.Run("re-enroll mints a fresh, verifying biscuit unconditionally", func(t *testing.T) {
+		srv, _, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		first := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if first.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+			t.Fatalf("expected APPROVED on first enroll, got %v", first.Status)
+		}
+		cpPubKey := ed25519.PublicKey(first.ControlPlanePublicKey)
+		trustedKeys := []ed25519.PublicKey{cpPubKey}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(first.BiscuitToken, pID, trustedKeys, srv.config.BiscuitTimeout); err != nil {
+			t.Fatalf("first biscuit failed to verify immediately after issuance: %v", err)
+		}
+
+		// No sleep needed: re-minting is unconditional now, so an immediate
+		// re-enroll must still get back a brand-new, verifying biscuit -- a
+		// stronger assertion than "eventually, once stale enough" was.
+		second := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if second.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+			t.Fatalf("expected APPROVED on re-enroll, got %v", second.Status)
+		}
+		if bytes.Equal(second.BiscuitToken, first.BiscuitToken) {
+			t.Fatal("re-enroll returned the exact same biscuit instead of minting a fresh one")
+		}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(second.BiscuitToken, pID, trustedKeys, srv.config.BiscuitTimeout); err != nil {
+			t.Fatalf("refreshed biscuit from re-enroll does not verify: %v", err)
+		}
+	})
+
+	t.Run("enroll status never mints and never resurrects a stale token", func(t *testing.T) {
+		_, store, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		first := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+
+		statusResp, err := (&http.Client{Timeout: 5 * time.Second}).Do(signedEnrollStatusRequest(t, baseURL, priv, pID.String(), time.Now().UnixMilli()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		statusBody, _ := io.ReadAll(statusResp.Body)
+		_ = statusResp.Body.Close()
+		var polled api.BootstrapEnrollResponse
+		if err := proto.Unmarshal(statusBody, &polled); err != nil {
+			t.Fatalf("unmarshal polled BootstrapEnrollResponse: %v", err)
+		}
+		if !bytes.Equal(polled.BiscuitToken, first.BiscuitToken) {
+			t.Fatal("GET /enroll/status minted a new biscuit instead of returning the stored one unchanged")
+		}
+
+		record, err := store.GetNode(context.Background(), pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(record.Biscuit, first.BiscuitToken) {
+			t.Fatal("GET /enroll/status mutated the enrolled node record's biscuit")
+		}
+	})
+
+	t.Run("re-enrolled biscuit refreshes cleanly via refresh", func(t *testing.T) {
+		_, _, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		second := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+
+		// refreshNode's reuse-detection compares the presented biscuit
+		// against the node record's stored one -- exactly what the re-mint's
+		// nodeRecord.Biscuit sync protects; it fails outright if that drifted.
+		refreshed := refreshNode(t, baseURL, priv, second.BiscuitToken)
+		if len(refreshed.BiscuitToken) == 0 {
+			t.Fatal("refresh after re-enroll returned an empty biscuit")
+		}
+	})
+
+	t.Run("re-enroll recovers a node whose signing key retired past grace", func(t *testing.T) {
+		// The #367 scenario: the node's biscuit is signed by a key the
+		// control plane has since retired, so /refresh structurally cannot
+		// accept it. The manual recovery lever is a fresh bootstrap token,
+		// and re-enroll must then mint under the *active* key.
+		srv, store, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		first := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		oldKey := ed25519.PublicKey(first.ControlPlanePublicKey)
+
+		newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A negative grace period retires the old key immediately.
+		if err := store.RotateKeys(context.Background(), newPriv, newPub, -time.Second); err != nil {
+			t.Fatal(err)
+		}
+
+		if code := refreshStatus(t, baseURL, priv, first.BiscuitToken); code != http.StatusUnauthorized {
+			t.Fatalf("/refresh with a retired-key biscuit: got %d, want 401", code)
+		}
+
+		second := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if second.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+			t.Fatalf("re-enroll after key retirement: got %v, want APPROVED", second.Status)
+		}
+		if !bytes.Equal(second.ControlPlanePublicKey, newPub) {
+			t.Fatal("re-enroll response did not advertise the active signing key")
+		}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(second.BiscuitToken, pID, []ed25519.PublicKey{oldKey}, srv.config.BiscuitTimeout); err == nil {
+			t.Fatal("re-minted biscuit still verifies under the retired key")
+		}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(second.BiscuitToken, pID, []ed25519.PublicKey{newPub}, srv.config.BiscuitTimeout); err != nil {
+			t.Fatalf("re-minted biscuit does not verify under the active key: %v", err)
+		}
+		if refreshed := refreshNode(t, baseURL, priv, second.BiscuitToken); len(refreshed.BiscuitToken) == 0 {
+			t.Fatal("refresh after key-retirement re-enroll returned an empty biscuit")
+		}
+	})
+
+	t.Run("re-enroll ignores the request's own declared labels", func(t *testing.T) {
+		_, store, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, map[string]string{"component": "original"})
+
+		// Same token, so RequestedRole must still equal the token's own role
+		// to pass /enroll's earlier check, but a different declared label
+		// set -- the existing-request branch must not let this through.
+		bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, map[string]string{"component": "attacker-supplied"})
+
+		record, err := store.GetNode(context.Background(), pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.Labels["component"] != "original" {
+			t.Fatalf("re-enroll changed the enrolled node's stored labels to %v, want the original attested set unchanged", record.Labels)
+		}
+	})
+
+	t.Run("a banned peer is refused, not re-minted", func(t *testing.T) {
+		_, store, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if err := store.SetNodeBanned(context.Background(), pID.String(), true); err != nil {
+			t.Fatal(err)
+		}
+
+		out := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if out.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_REJECTED {
+			t.Fatalf("expected REJECTED for a banned peer's re-enroll, got %v", out.Status)
+		}
+	})
+
+	t.Run("a node whose record role no longer matches the token's is refused", func(t *testing.T) {
+		_, store, baseURL, token := start(t, api.RoleRouter, 5)
+		priv, pID, pubBytes := newPeer(t)
+
+		bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+
+		// Simulate the node record's role having drifted since approval
+		// (e.g. a manual admin change) rather than via a real HTTP path,
+		// since there isn't one for it -- the defensive check exists
+		// precisely because this shouldn't be trusted to never happen.
+		record, err := store.GetNode(context.Background(), pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Role = api.RoleNode
+		if err := store.EnrollNode(context.Background(), record); err != nil {
+			t.Fatal(err)
+		}
+
+		out := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if out.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_REJECTED {
+			t.Fatalf("expected REJECTED for a token/node role mismatch, got %v", out.Status)
+		}
+	})
+}
+
+// TestAdminRevokeBootstrapToken pins DELETE /admin/bootstrap-tokens/{id}
+// (#368's other half): a soft revoke, 404 only for an id that names no
+// token at all, idempotent otherwise, enforced at /enroll for both a brand
+// new enrollment and a re-enroll of an already-approved one.
+func TestAdminRevokeBootstrapToken(t *testing.T) {
+	issuer, _ := startCustomMockOIDC(t)
+	srv, store, baseURL := setupTestServer(t, issuer)
+	defer func() {
+		_ = srv.Close()
+		_ = store.Close()
+	}()
+	const adminToken = "super-secret-admin-token"
+	srv.config.AdminToken = adminToken
+	srv.config.AutoApproveEnrollment = true
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	deleteToken := func(id string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodDelete, baseURL+"/admin/bootstrap-tokens/"+id, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("DELETE /admin/bootstrap-tokens/%s: %v", id, err)
+		}
+		return resp
+	}
+
+	if resp := deleteToken("no-such-id"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("revoking an unknown token id: got %d, want 404", resp.StatusCode)
+	}
+
+	token := createAdminBootstrapToken(t, baseURL, adminToken, api.RoleRouter, 5)
+
+	// createAdminBootstrapToken returns the plaintext; the id path parameter
+	// is its sha256 hash (see HandleAdminBootstrapTokens), so fetch it back
+	// via the list rather than recomputing the hash here.
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/admin/bootstrap-tokens", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	listResp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed []struct {
+		ID string
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	_ = listResp.Body.Close()
+	if len(listed) != 1 {
+		t.Fatalf("GET /admin/bootstrap-tokens returned %d tokens, want 1", len(listed))
+	}
+	tokenID := listed[0].ID
+
+	priv, pub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pID, err := peer.IDFromPrivateKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubBytes, err := crypto.MarshalPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+	if first.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+		t.Fatalf("expected APPROVED before revocation, got %v", first.Status)
+	}
+
+	if resp := deleteToken(tokenID); resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("revoke: got %d: %s", resp.StatusCode, body)
+	}
+	// Idempotent: revoking the same token again must still succeed.
+	if resp := deleteToken(tokenID); resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("second revoke: got %d: %s", resp.StatusCode, body)
+	}
+
+	// A revoked token can neither enroll a brand new peer...
+	otherPriv, otherPub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPID, err := peer.IDFromPrivateKey(otherPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPubBytes, err := crypto.MarshalPublicKey(otherPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := bootstrapEnroll(t, baseURL, token, otherPriv, otherPID, otherPubBytes, api.RoleRouter, nil); out.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_REJECTED {
+		t.Errorf("new enrollment with a revoked token: got %v, want REJECTED", out.Status)
+	}
+
+	// ...nor re-mint a fresh biscuit for the peer that enrolled before it was
+	// revoked - a revoked token must not become an exception to the
+	// unconditional re-mint enforced above.
+	if out := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil); out.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_REJECTED {
+		t.Errorf("re-enroll with a revoked token: got %v, want REJECTED", out.Status)
+	}
+}
+
+// TestAutonomousRecovery pins the opt-in retired-key fallback on /refresh
+// (#367). A bootstrap node whose biscuit is signed by a key the control plane
+// has since retired cannot have that biscuit verified, so /refresh normally
+// refuses it and the node needs an operator to mint a new bootstrap token.
+// With autonomous_recovery set on the node record - seeded from the token
+// that enrolled it, or toggled per node by an admin - the control plane
+// instead identifies the node by TokenRefreshRequest.peer_id, authenticates
+// the biscuit by byte-matching the last one it issued, verifies the fresh
+// challenge against the stored key, re-checks admission, and mints under the
+// active key. Off by default: a node that can always come back on its own
+// key holds a credential that never expires.
+func TestAutonomousRecovery(t *testing.T) {
+	issuer, mintToken := startCustomMockOIDC(t)
+	const adminToken = "super-secret-admin-token"
+
+	type fixture struct {
+		srv     *Server
+		store   storage.Store
+		baseURL string
+		priv    crypto.PrivKey
+		pID     peer.ID
+		biscuit []byte
+		cpKey   ed25519.PublicKey
+	}
+
+	// enroll brings up a fresh control plane, enrolls a router with a token
+	// minted with the given autonomous_recovery flag, and returns everything
+	// a subtest needs to drive /refresh for it.
+	enroll := func(t *testing.T, autonomous bool) *fixture {
+		t.Helper()
+		srv, store, baseURL := setupTestServer(t, issuer)
+		t.Cleanup(func() {
+			_ = srv.Close()
+			_ = store.Close()
+		})
+		srv.config.AdminToken = adminToken
+		srv.config.AutoApproveEnrollment = true
+
+		body := fmt.Sprintf(`{"role":%q,"ttl_hours":2,"max_usages":5,"autonomous_recovery":%t}`, api.RoleRouter, autonomous)
+		token := createAdminBootstrapTokenJSON(t, baseURL, adminToken, body)
+
+		priv, pub, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pID, err := peer.IDFromPrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pubBytes, err := crypto.MarshalPublicKey(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := bootstrapEnroll(t, baseURL, token, priv, pID, pubBytes, api.RoleRouter, nil)
+		if resp.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+			t.Fatalf("enroll: got %v, want APPROVED", resp.Status)
+		}
+
+		record, err := store.GetNode(context.Background(), pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.AutonomousRecovery != autonomous {
+			t.Fatalf("node record AutonomousRecovery = %t, want %t (must be copied from the token)", record.AutonomousRecovery, autonomous)
+		}
+		return &fixture{srv: srv, store: store, baseURL: baseURL, priv: priv, pID: pID, biscuit: resp.BiscuitToken, cpKey: ed25519.PublicKey(resp.ControlPlanePublicKey)}
+	}
+
+	// retireSigningKey rotates to a new key with a negative grace period so
+	// the key that signed every biscuit issued so far is gone at once.
+	retireSigningKey := func(t *testing.T, store storage.Store) ed25519.PublicKey {
+		t.Helper()
+		newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RotateKeys(context.Background(), newPriv, newPub, -time.Second); err != nil {
+			t.Fatal(err)
+		}
+		return newPub
+	}
+
+	// refresh drives /refresh with peer_id set, the way a node does, and
+	// returns status and body.
+	refresh := func(t *testing.T, f *fixture, biscuit []byte) (int, []byte) {
+		t.Helper()
+		return refreshAs(t, f.baseURL, f.priv, biscuit, f.pID.String())
+	}
+
+	setRecovery := func(t *testing.T, f *fixture, peerID string, enabled bool) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, f.baseURL+"/admin/nodes/"+peerID+"/autonomous-recovery", bytes.NewBufferString(fmt.Sprintf(`{"enabled":%t}`, enabled)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	t.Run("opted in via token recovers across key retirement", func(t *testing.T) {
+		f := enroll(t, true)
+		newKey := retireSigningKey(t, f.store)
+
+		code, body := refresh(t, f, f.biscuit)
+		if code != http.StatusOK {
+			t.Fatalf("/refresh after key retirement: got %d %s, want 200", code, body)
+		}
+		var out api.TokenRefreshResponse
+		if err := proto.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(out.BiscuitToken, f.pID, []ed25519.PublicKey{newKey}, f.srv.config.BiscuitTimeout); err != nil {
+			t.Fatalf("recovered biscuit does not verify under the active key: %v", err)
+		}
+		if _, _, err := identity.VerifyBiscuitAndGetKey(out.BiscuitToken, f.pID, []ed25519.PublicKey{f.cpKey}, f.srv.config.BiscuitTimeout); err == nil {
+			t.Fatal("recovered biscuit still verifies under the retired key")
+		}
+		// And the recovered biscuit is a normal one from here on.
+		if next := refreshNode(t, f.baseURL, f.priv, out.BiscuitToken); len(next.BiscuitToken) == 0 {
+			t.Fatal("refresh after recovery returned an empty biscuit")
+		}
+	})
+
+	t.Run("not opted in is refused and told to re-enroll", func(t *testing.T) {
+		f := enroll(t, false)
+		retireSigningKey(t, f.store)
+
+		code, body := refresh(t, f, f.biscuit)
+		if code != http.StatusUnauthorized {
+			t.Fatalf("/refresh without opt-in: got %d %s, want 401", code, body)
+		}
+		if !strings.Contains(string(body), "not opted in to autonomous recovery") {
+			t.Fatalf("refusal should tell the operator what to change, got: %s", body)
+		}
+		record, err := f.store.GetNode(context.Background(), f.pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(record.Biscuit, f.biscuit) {
+			t.Fatal("a refused recovery must not rotate the stored biscuit")
+		}
+	})
+
+	t.Run("banned stays out even when opted in", func(t *testing.T) {
+		f := enroll(t, true)
+		retireSigningKey(t, f.store)
+		if err := f.store.SetNodeBanned(context.Background(), f.pID.String(), true); err != nil {
+			t.Fatal(err)
+		}
+
+		code, body := refresh(t, f, f.biscuit)
+		if code != http.StatusForbidden {
+			t.Fatalf("banned node's recovery: got %d %s, want 403", code, body)
+		}
+	})
+
+	t.Run("a replayed superseded biscuit is refused", func(t *testing.T) {
+		f := enroll(t, true)
+		// Rotate B1 -> B2 while the key is still live, then retire the key.
+		// Only B2 is redeemable; a captured B1 must not recover anything.
+		second := refreshNode(t, f.baseURL, f.priv, f.biscuit)
+		retireSigningKey(t, f.store)
+
+		code, body := refresh(t, f, f.biscuit)
+		if code != http.StatusUnauthorized {
+			t.Fatalf("replayed B1: got %d %s, want 401", code, body)
+		}
+		if code, body := refresh(t, f, second.BiscuitToken); code != http.StatusOK {
+			t.Fatalf("B2 recovery: got %d %s, want 200", code, body)
+		}
+	})
+
+	t.Run("recovery needs the node key, not just the biscuit", func(t *testing.T) {
+		f := enroll(t, true)
+		retireSigningKey(t, f.store)
+
+		// Same peer_id and last-issued biscuit, but the challenge is signed
+		// by someone else's key.
+		thief, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ts := time.Now().UnixMilli()
+		sig, err := thief.Sign(api.RefreshChallenge(f.pID.String(), ts))
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqData, err := proto.Marshal(&api.TokenRefreshRequest{Timestamp: ts, ChallengeSignature: sig, PeerId: f.pID.String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := doRefresh(t, f.baseURL, f.biscuit, reqData); code != http.StatusUnauthorized {
+			t.Fatalf("stolen-biscuit recovery: got %d, want 401", code)
+		}
+	})
+
+	t.Run("fallback does not reveal which peers are enrolled", func(t *testing.T) {
+		f := enroll(t, true)
+		retireSigningKey(t, f.store)
+
+		// Garbage bearer, no peer_id: the pre-#367 refusal.
+		garbage := []byte("not-a-biscuit")
+		baselineCode, baselineBody := refreshAs(t, f.baseURL, f.priv, garbage, "")
+		if baselineCode != http.StatusUnauthorized {
+			t.Fatalf("baseline: got %d, want 401", baselineCode)
+		}
+
+		// Garbage bearer with an enrolled peer_id: byte-match fails.
+		enrolledCode, enrolledBody := refreshAs(t, f.baseURL, f.priv, garbage, f.pID.String())
+
+		// Garbage bearer with a never-enrolled peer_id: record lookup fails.
+		stranger, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		strangerID, err := peer.IDFromPrivateKey(stranger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		strangerCode, strangerBody := refreshAs(t, f.baseURL, stranger, garbage, strangerID.String())
+
+		for name, got := range map[string]struct {
+			code int
+			body []byte
+		}{
+			"enrolled peer": {enrolledCode, enrolledBody},
+			"unknown peer":  {strangerCode, strangerBody},
+		} {
+			if got.code != baselineCode || !bytes.Equal(got.body, baselineBody) {
+				t.Errorf("%s: got %d %q, want the baseline %d %q", name, got.code, got.body, baselineCode, baselineBody)
+			}
+		}
+	})
+
+	t.Run("admin toggle opts an enrolled node in and out", func(t *testing.T) {
+		f := enroll(t, false)
+
+		if code := setRecovery(t, f, f.pID.String(), true); code != http.StatusNoContent {
+			t.Fatalf("enable: got %d, want 204", code)
+		}
+		retireSigningKey(t, f.store)
+		code, body := refresh(t, f, f.biscuit)
+		if code != http.StatusOK {
+			t.Fatalf("/refresh after admin opt-in: got %d %s, want 200", code, body)
+		}
+		var out api.TokenRefreshResponse
+		if err := proto.Unmarshal(body, &out); err != nil {
+			t.Fatal(err)
+		}
+
+		// A refresh must not clear the flag on its way through EnrollNode.
+		record, err := f.store.GetNode(context.Background(), f.pID.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !record.AutonomousRecovery {
+			t.Fatal("refresh cleared AutonomousRecovery")
+		}
+
+		if code := setRecovery(t, f, f.pID.String(), false); code != http.StatusNoContent {
+			t.Fatalf("disable: got %d, want 204", code)
+		}
+		retireSigningKey(t, f.store)
+		if code, body := refresh(t, f, out.BiscuitToken); code != http.StatusUnauthorized {
+			t.Fatalf("/refresh after admin opt-out: got %d %s, want 401", code, body)
+		}
+
+		unknown, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unknownID, err := peer.IDFromPrivateKey(unknown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := setRecovery(t, f, unknownID.String(), true); code != http.StatusNotFound {
+			t.Fatalf("toggle on a never-enrolled peer: got %d, want 404", code)
+		}
+		if code := setRecovery(t, f, "not-a-peer-id", true); code != http.StatusBadRequest {
+			t.Fatalf("toggle on a malformed peer id: got %d, want 400", code)
+		}
+	})
+
+	t.Run("peer_id must match a verifiable biscuit", func(t *testing.T) {
+		f := enroll(t, true)
+		other, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		otherID, err := peer.IDFromPrivateKey(other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, body := refreshAs(t, f.baseURL, f.priv, f.biscuit, otherID.String()); code != http.StatusUnauthorized {
+			t.Fatalf("valid biscuit with a foreign peer_id: got %d %s, want 401", code, body)
+		}
+	})
+
+	t.Run("only admins may mint tokens with autonomous_recovery", func(t *testing.T) {
+		f := enroll(t, false)
+		// A non-admin OIDC user hits the user endpoint.
+		userJWT := mintToken(map[string]interface{}{"sub": "plain-user", "email": "user@example.com"})
+		body := fmt.Sprintf(`{"role":%q,"autonomous_recovery":true}`, api.RoleNode)
+		req, err := http.NewRequest(http.MethodPost, f.baseURL+"/user/bootstrap-tokens", bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+userJWT)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("non-admin minting an autonomous_recovery token: got %d, want 403", resp.StatusCode)
+		}
+	})
 }

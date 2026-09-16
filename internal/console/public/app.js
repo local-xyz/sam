@@ -243,7 +243,7 @@ async function loadData() {
             setTableMessage('table-users', 4, 'Restricted to administrators.');
             setTableMessage('table-enrollments', 4, 'Restricted to administrators.');
         }
-        renderNodesTable(data.enrolled_nodes || []);
+        renderNodesTable(data.enrolled_nodes || [], role);
         renderServicesTable(data.node_catalog || {}, buildLabelsByPeer(data.enrolled_nodes || []));
         renderRoutersTable(data.active_routers || []);
         renderRouterTopography(data.active_routers || []);
@@ -263,7 +263,7 @@ async function loadData() {
         console.error('Failed to load dashboard data:', error);
         const errMsg = `Error loading data: ${error.message}`;
         setTableMessage('table-users', 4, errMsg, true);
-        setTableMessage('table-nodes', 4, errMsg, true);
+        setTableMessage('table-nodes', 5, errMsg, true);
         setTableMessage('table-enrollments', 4, errMsg, true);
         setTableMessage('table-routers', 3, errMsg, true);
         setTableMessage('table-bootstrap', 5, errMsg, true);
@@ -366,26 +366,48 @@ function buildLabelsByPeer(nodes) {
     return byPeer;
 }
 
-function renderNodesTable(nodes) {
+function renderNodesTable(nodes, role) {
     const tbody = document.getElementById('table-nodes');
     if (nodes.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="4" class="text-center">No enrolled nodes found</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center">No enrolled nodes found</td></tr>`;
         return;
     }
 
-    tbody.innerHTML = nodes.map(node => `
+    tbody.innerHTML = nodes.map(node => {
+        const recovery = !!node.AutonomousRecovery;
+        const recoveryBadge = recovery
+            ? `<span class="badge badge-approved" title="May refresh its credential after the signing key that issued it is retired">Autonomous</span>`
+            : `<span class="badge badge-pending" title="Needs a new bootstrap token if offline past the key grace period">Manual</span>`;
+        // The flag decides whether a lost device can rejoin on its own key, so
+        // only admins get the toggle; owners just see the state.
+        const toggle = role === 'admin'
+            ? `<button class="btn btn-sm" onclick="setAutonomousRecovery('${escapeHTML(node.PeerID)}', ${recovery ? 'false' : 'true'})">${recovery ? 'Disable recovery' : 'Enable recovery'}</button>`
+            : '';
+        return `
         <tr>
             <td>${peerCell(node.PeerID, node.Labels)}</td>
             <td>${escapeHTML(node.Role)}</td>
             <td>${escapeHTML(node.OwnerID)}</td>
+            <td>${recoveryBadge}</td>
             <td>
                 <div class="actions-cell">
+                    ${toggle}
                     <button class="btn btn-sm btn-danger" onclick="revokeDevice('${escapeHTML(node.PeerID)}')">Revoke</button>
                 </div>
             </td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
 }
+
+window.setAutonomousRecovery = function(peerID, enabled) {
+    const prompt = enabled
+        ? 'Allow this node to refresh its credential on its own key even after the signing key that issued it is retired? A lost or stolen device with this flag can rejoin the mesh until it is revoked.'
+        : 'Disable autonomous recovery? If this node is offline past the key grace period it will need a new bootstrap token to rejoin.';
+    if (confirm(prompt)) {
+        actionRequest(`api/admin/nodes/${peerID}/autonomous-recovery`, 'POST', { enabled }).catch(() => {});
+    }
+};
 
 // node_catalog is {peerID: {services: [{name, type, description}], reported_at}},
 // already restricted server-side to nodes that are still admitted; type is
@@ -574,6 +596,14 @@ function updateUIForRole(role, userId) {
             }
         }
     }
+    // Same for autonomous recovery: the server refuses it from non-admins.
+    const recoveryGroup = document.getElementById('token-recovery-group');
+    if (recoveryGroup) {
+        recoveryGroup.style.display = role === 'admin' ? 'flex' : 'none';
+        if (role !== 'admin') {
+            document.getElementById('token-recovery').checked = false;
+        }
+    }
     
     // 4. Hide users/pending sections from stats grid for normal users
     const usersCard = document.getElementById('stat-users').closest('.stat-card');
@@ -699,12 +729,20 @@ function renderRouterTopography(routers) {
 function renderBootstrapTokensTable(tokens) {
     const tbody = document.getElementById('table-bootstrap');
     if (tokens.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="text-center">No active bootstrap tokens found</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8" class="text-center">No active bootstrap tokens found</td></tr>`;
         return;
     }
 
     tbody.innerHTML = tokens.map(token => {
         const expiresAt = token.ExpiresAt && !token.ExpiresAt.startsWith('0001') ? new Date(token.ExpiresAt).toLocaleString() : 'Never';
+        const revoked = !!token.RevokedAt;
+        const status = revoked
+            ? `<span class="badge badge-rejected">Revoked</span>`
+            : `<span class="badge badge-approved">Active</span>`;
+        const recovery = token.AutonomousRecovery ? 'Autonomous' : 'Manual';
+        const action = revoked
+            ? '-'
+            : `<button class="btn btn-sm btn-danger" onclick="revokeBootstrapToken('${escapeHTML(token.ID)}')">Revoke</button>`;
         return `
             <tr>
                 <td><code>${escapeHTML(String(token.ID || '').substring(0, 8))}...</code></td>
@@ -712,10 +750,19 @@ function renderBootstrapTokensTable(tokens) {
                 <td><code>${escapeHTML(token.OwnerID || '-')}</code></td>
                 <td>${escapeHTML(String(token.UsagesCount))} / ${escapeHTML(String(token.MaxUsages))}</td>
                 <td>${escapeHTML(expiresAt)}</td>
+                <td>${recovery}</td>
+                <td>${status}</td>
+                <td>${action}</td>
             </tr>
         `;
     }).join('');
 }
+
+window.revokeBootstrapToken = function(id) {
+    if (confirm('Revoke this bootstrap token? It will no longer be usable to enroll or re-enroll any node.')) {
+        actionRequest(`api/admin/bootstrap-tokens/${id}`, 'DELETE').catch(() => {});
+    }
+};
 
 window.generateBootstrapToken = async function() {
     const role = document.getElementById('token-role').value;
@@ -723,6 +770,7 @@ window.generateBootstrapToken = async function() {
     const max_usages = parseInt(document.getElementById('token-usages').value, 10);
     const ttl_hours = parseInt(document.getElementById('token-ttl').value, 10) || 24;
     const description = document.getElementById('token-desc').value;
+    const autonomous_recovery = document.getElementById('token-recovery').checked;
 
     const payload = {
         role,
@@ -733,6 +781,9 @@ window.generateBootstrapToken = async function() {
     // Omitted entirely so the server falls back to the authenticated session.
     if (owner_id) {
         payload.owner_id = owner_id;
+    }
+    if (autonomous_recovery) {
+        payload.autonomous_recovery = true;
     }
 
     try {

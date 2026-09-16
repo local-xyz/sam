@@ -35,7 +35,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/biscuit-auth/biscuit-go/v2"
 	"github.com/google/sam/api"
 	"github.com/google/sam/internal/identity"
 	golog "github.com/ipfs/go-log/v2"
@@ -619,6 +618,23 @@ func (r *Router) reEnroll() error {
 	return r.enrollWithTokens(r.Host.ID())
 }
 
+// recoverAfterLease401 restores the router's standing with the control plane
+// after a lease renewal was refused. A refresh goes first: it succeeds on
+// proof of possession alone when the biscuit's signing key was retired and
+// the operator opted this router in to autonomous recovery, and it already
+// falls back to re-enrollment on a 401 of its own. Any other failure still
+// ends in re-enrollment with the bootstrap token, the pre-existing contract.
+func (r *Router) recoverAfterLease401() error {
+	if r.privKey != nil && r.ctx != nil {
+		err := r.RefreshEnrollment(r.ctx)
+		if err == nil {
+			return nil
+		}
+		logger.Warnf("Refresh after lease 401 failed (%v), re-enrolling", err)
+	}
+	return r.reEnroll()
+}
+
 func (r *Router) syncKeys() error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(r.config.ControlPlaneURL + "/keys")
@@ -827,12 +843,12 @@ func (r *Router) renewLease() {
 		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			logger.Warnf("Control plane lease renewal rejected (401 Unauthorized: %s), attempting re-enrollment...", string(body))
-			if err := r.reEnroll(); err != nil {
-				logger.Errorf("Re-enrollment failed after 401 Unauthorized lease renewal: %v", err)
+			logger.Warnf("Control plane lease renewal rejected (401 Unauthorized: %s), attempting recovery...", string(body))
+			if err := r.recoverAfterLease401(); err != nil {
+				logger.Errorf("Recovery failed after 401 Unauthorized lease renewal: %v", err)
 				return
 			}
-			logger.Info("Successfully re-enrolled after 401 Unauthorized lease renewal, retrying lease renewal...")
+			logger.Info("Successfully recovered after 401 Unauthorized lease renewal, retrying lease renewal...")
 			continue
 		}
 
@@ -1125,21 +1141,7 @@ func (r *Router) performMutualAuth(s network.Stream) error {
 	}
 
 	// Enforce required role inside the biscuit
-	authorizer, err := b.Authorizer(verifyingKey, identity.AuthorizerOptions(r.config.BiscuitTimeout)...)
-	if err != nil {
-		return fmt.Errorf("authorizer instantiation failed: %w", err)
-	}
-
-	authorizer.AddCheck(biscuit.Check{Queries: []biscuit.Rule{
-		{
-			Body: []biscuit.Predicate{
-				{Name: api.FactRole, IDs: []biscuit.Term{biscuit.String(r.config.RequiredRole)}},
-			},
-		},
-	}})
-	authorizer.AddPolicy(api.AllowIfTruePolicy)
-
-	if err := authorizer.Authorize(); err != nil {
+	if err := identity.RequireRole(b, verifyingKey, r.config.RequiredRole, r.config.BiscuitTimeout); err != nil {
 		return fmt.Errorf("remote peer lacks router authorization role: %w", err)
 	}
 
@@ -1232,10 +1234,14 @@ func (r *Router) RefreshEnrollment(ctx context.Context) error {
 		return fmt.Errorf("failed to generate signature: %w", err)
 	}
 
-	// 2. Construct request
+	// 2. Construct request. peer_id lets the control plane find this
+	// router's record when the biscuit's signing key has been retired and
+	// the biscuit itself can no longer be verified (autonomous recovery,
+	// opt-in server-side); it is cross-checked against the biscuit otherwise.
 	req := &api.TokenRefreshRequest{
 		ChallengeSignature: sig,
 		Timestamp:          timestamp,
+		PeerId:             peerID.String(),
 	}
 	reqData, err := proto.Marshal(req)
 	if err != nil {

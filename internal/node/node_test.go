@@ -17,6 +17,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"os"
 	"os/exec"
 	"testing"
@@ -26,9 +27,12 @@ import (
 	"github.com/google/sam/api"
 	"github.com/google/sam/internal/identity"
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-msgio"
 	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestAnnounceFilter(t *testing.T) {
@@ -307,20 +311,40 @@ func TestPruneTrustedKeys(t *testing.T) {
 	}
 }
 
-// TestVerifyBiscuitRejectsExpiredToken covers the peer-admission half of #296:
-// HandleAuthHandshake admits a peer into authPeers, which the relay ACL then
-// trusts, so it must reject an expired token exactly like the dataplane does.
-func TestVerifyBiscuitRejectsExpiredToken(t *testing.T) {
+// TestHandleAuthHandshake covers the admission office: the relay ACL trusts
+// authPeers, so the cached instant must be the token's own expiry, and a token
+// that is expired or bound to another peer must leave no entry at all (#296).
+func TestHandleAuthHandshake(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	remotePeer := peer.ID("dummy-peer")
+	ctx := context.Background()
 
-	mint := func(expiration time.Time) []byte {
+	serverHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = serverHost.Close() }()
+	clientHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = clientHost.Close() }()
+
+	node := &SamNode{
+		trustedKeys:    []TrustedKey{{Key: pub, ReceivedAt: time.Now()}},
+		BiscuitTimeout: time.Second,
+	}
+	serverHost.SetStreamHandler(api.AuthProtocolID, node.HandleAuthHandshake)
+	if err := clientHost.Connect(ctx, peer.AddrInfo{ID: serverHost.ID(), Addrs: serverHost.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+
+	mint := func(boundTo peer.ID, expiration time.Time) []byte {
 		builder := biscuit.NewBuilder(priv)
 		for _, f := range []biscuit.Fact{
-			{Predicate: biscuit.Predicate{Name: api.FactNode, IDs: []biscuit.Term{biscuit.String(remotePeer.String())}}},
+			{Predicate: biscuit.Predicate{Name: api.FactNode, IDs: []biscuit.Term{biscuit.String(boundTo.String())}}},
 			{Predicate: biscuit.Predicate{Name: api.FactExpiration, IDs: []biscuit.Term{biscuit.Date(expiration)}}},
 		} {
 			if err := builder.AddAuthorityFact(f); err != nil {
@@ -338,34 +362,131 @@ func TestVerifyBiscuitRejectsExpiredToken(t *testing.T) {
 		return data
 	}
 
-	node := &SamNode{
-		trustedKeys:    []TrustedKey{{Key: pub, ReceivedAt: time.Now()}},
-		BiscuitTimeout: 500 * time.Millisecond,
+	// handshake presents token and returns the node's answer; a rejected peer
+	// gets the stream closed on it with no answer at all.
+	handshake := func(token []byte) (*api.AuthResponse, error) {
+		s, err := clientHost.NewStream(ctx, serverHost.ID(), api.AuthProtocolID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = s.Close() }()
+		if err := s.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		frame, err := proto.Marshal(&api.AuthFrame{Biscuit: token})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := msgio.NewVarintWriter(s).WriteMsg(frame); err != nil {
+			t.Fatal(err)
+		}
+		reader := msgio.NewVarintReaderSize(s, 1024*64)
+		msg, err := reader.ReadMsg()
+		if err != nil {
+			return nil, err
+		}
+		defer reader.ReleaseMsg(msg)
+		var resp api.AuthResponse
+		if err := proto.Unmarshal(msg, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return &resp, nil
 	}
 
 	want := time.Now().Add(time.Hour)
-	trustedKeys := node.getTrustedPublicKeys()
-	b, verifyingKey, err := identity.VerifyBiscuitAndGetKey(mint(want), remotePeer, trustedKeys, node.BiscuitTimeout)
+	resp, err := handshake(mint(clientHost.ID(), want))
 	if err != nil {
-		t.Fatalf("valid token rejected: %v", err)
+		t.Fatalf("valid token got no answer: %v", err)
 	}
-	expiry := time.Now().Add(node.BiscuitTimeout)
-	if authorizer, authErr := b.Authorizer(verifyingKey, identity.AuthorizerOptions(node.BiscuitTimeout)...); authErr == nil {
-		identity.EnforceExpiration(authorizer)
-		authorizer.AddPolicy(api.AllowIfTruePolicy)
-		if authErr := authorizer.Authorize(); authErr == nil {
-			if e, expErr := identity.ExpirationOf(authorizer); expErr == nil {
-				expiry = e
-			}
-		}
+	if !resp.Success {
+		t.Fatalf("valid token rejected: %s", resp.Error)
+	}
+	v, ok := node.authPeers.Load(clientHost.ID())
+	if !ok {
+		t.Fatal("admitted peer not recorded in authPeers")
+	}
+	expiry, ok := v.(time.Time)
+	if !ok {
+		t.Fatalf("authPeers holds %T, want time.Time", v)
 	}
 	// The admission is cached against this instant, so it has to be the token's.
-	if skew := expiry.Sub(want); skew < -time.Second || skew > time.Second {
-		t.Errorf("reported expiry %v, want ~%v", expiry, want)
+	if skew := expiry.Sub(want).Abs(); skew > time.Second {
+		t.Errorf("cached expiry %v, want ~%v", expiry, want)
 	}
 
-	if _, _, err := identity.VerifyBiscuitAndGetKey(mint(time.Now().Add(-time.Hour)), remotePeer, trustedKeys, node.BiscuitTimeout); err == nil {
-		t.Fatal("expired token admitted on the peer-authentication path")
+	for name, token := range map[string][]byte{
+		"expired":               mint(clientHost.ID(), time.Now().Add(-time.Hour)),
+		"bound to another peer": mint(serverHost.ID(), want),
+	} {
+		node.authPeers.Delete(clientHost.ID())
+		if resp, err := handshake(token); err == nil {
+			t.Errorf("%s: token answered with %+v, want the stream closed", name, resp)
+		}
+		if _, admitted := node.authPeers.Load(clientHost.ID()); admitted {
+			t.Errorf("%s: peer admitted", name)
+		}
+	}
+}
+
+// TestPerformRouterAuthHandshakeRequiresRouterRole: a router whose biscuit
+// verifies but carries no role("router") is a fatal auth failure, so the node
+// gives up on it instead of retrying.
+func TestPerformRouterAuthHandshakeRequiresRouterRole(t *testing.T) {
+	cpPub, cpPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	clientHost, err := libp2p.New(libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = clientHost.Close() }()
+
+	node := &SamNode{
+		trustedKeys:    []TrustedKey{{Key: cpPub, ReceivedAt: time.Now()}},
+		BiscuitTimeout: time.Second,
+	}
+
+	for _, tt := range []struct {
+		role   string
+		wantOK bool
+	}{
+		{api.RoleRouter, true},
+		{api.RoleNode, false},
+	} {
+		t.Run(tt.role, func(t *testing.T) {
+			info, err := peer.AddrInfoFromString(startMockRouterWithKey(t, cpPriv, tt.role))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := clientHost.Connect(ctx, *info); err != nil {
+				t.Fatal(err)
+			}
+			s, err := clientHost.NewStream(ctx, info.ID, api.AuthProtocolID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = s.Close() }()
+			if err := s.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			ok, err := node.performRouterAuthHandshake(s, []byte("node-biscuit"), info.ID)
+			if tt.wantOK {
+				if err != nil || !ok {
+					t.Fatalf("router with role %q rejected: ok=%v err=%v", tt.role, ok, err)
+				}
+				return
+			}
+			if err == nil || ok {
+				t.Fatalf("router with role %q accepted", tt.role)
+			}
+			if !errors.Is(err, ErrFatalAuth) {
+				t.Errorf("got %v, want ErrFatalAuth", err)
+			}
+		})
 	}
 }
 

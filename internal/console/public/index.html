@@ -192,11 +192,12 @@
                                     <th>Node ID</th>
                                     <th>Type</th>
                                     <th>Owner</th>
+                                    <th>Recovery</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="table-nodes">
-                                <tr><td colspan="4" class="text-center">Loading...</td></tr>
+                                <tr><td colspan="5" class="text-center">Loading...</td></tr>
                             </tbody>
                         </table>
                         </div>
@@ -309,6 +310,12 @@
                                 <label for="token-desc" class="field-label">Description</label>
                                 <input type="text" id="token-desc" class="field-input" placeholder="Token purpose">
                             </div>
+                            <div class="input-group field" id="token-recovery-group">
+                                <label for="token-recovery" class="field-label">
+                                    <input type="checkbox" id="token-recovery"> Autonomous recovery
+                                </label>
+                                <small class="field-hint">Admins only: nodes enrolled with this token may refresh their credential on their own key even after the signing key that issued it has been retired. Off by default so a node offline past the key grace period needs a new token to rejoin.</small>
+                            </div>
                             <button type="submit" class="btn btn-primary form-submit">Generate Token</button>
                         </form>
                         <div id="token-result" class="token-result" hidden>
@@ -335,10 +342,13 @@
                                     <th>Owner</th>
                                     <th>Usages</th>
                                     <th>Expires</th>
+                                    <th>Recovery</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="table-bootstrap">
-                                <tr><td colspan="5" class="text-center">Loading...</td></tr>
+                                <tr><td colspan="8" class="text-center">Loading...</td></tr>
                             </tbody>
                         </table>
                         </div>

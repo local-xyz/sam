@@ -1726,7 +1726,15 @@ type TokenRefreshRequest struct {
 	// verifies nowhere else.
 	ChallengeSignature []byte `protobuf:"bytes,1,opt,name=challenge_signature,json=challengeSignature,proto3" json:"challenge_signature,omitempty"`
 	// Unix milliseconds. Must be within the control plane's freshness window.
-	Timestamp     int64 `protobuf:"varint,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Timestamp int64 `protobuf:"varint,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// The caller's peer ID. Optional: the control plane normally reads it
+	// from the verified biscuit. It is consulted only when the biscuit's
+	// signing key has been retired, so the biscuit cannot be verified: the
+	// control plane then looks up the enrolled node record by this ID and,
+	// if the node was opted in to autonomous recovery, accepts the request
+	// when the presented biscuit is byte-identical to the last one it
+	// issued and the challenge verifies against the stored public key.
+	PeerId        string `protobuf:"bytes,3,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1773,6 +1781,13 @@ func (x *TokenRefreshRequest) GetTimestamp() int64 {
 		return x.Timestamp
 	}
 	return 0
+}
+
+func (x *TokenRefreshRequest) GetPeerId() string {
+	if x != nil {
+		return x.PeerId
+	}
+	return ""
 }
 
 type TokenRefreshResponse struct {
@@ -3081,10 +3096,11 @@ const file_api_sam_proto_rawDesc = "" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"/\n" +
 	"\fKeysResponse\x12\x1f\n" +
 	"\vpublic_keys\x18\x01 \x03(\fR\n" +
-	"publicKeys\"d\n" +
+	"publicKeys\"}\n" +
 	"\x13TokenRefreshRequest\x12/\n" +
 	"\x13challenge_signature\x18\x01 \x01(\fR\x12challengeSignature\x12\x1c\n" +
-	"\ttimestamp\x18\x02 \x01(\x03R\ttimestamp\"\x7f\n" +
+	"\ttimestamp\x18\x02 \x01(\x03R\ttimestamp\x12\x17\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"\x7f\n" +
 	"\x14TokenRefreshResponse\x12#\n" +
 	"\rbiscuit_token\x18\x01 \x01(\fR\fbiscuitToken\x12\x1d\n" +
 	"\n" +

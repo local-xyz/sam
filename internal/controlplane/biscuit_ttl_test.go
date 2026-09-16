@@ -118,6 +118,49 @@ func registerNode(t *testing.T, cpURL, jwtToken string) (crypto.PrivKey, peer.ID
 func refreshNode(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit []byte) *api.TokenRefreshResponse {
 	t.Helper()
 
+	resp := postRefresh(t, cpURL, priv, currentBiscuit, "")
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /refresh body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/refresh status %s: %s", resp.Status, string(body))
+	}
+
+	var refreshResp api.TokenRefreshResponse
+	if err := proto.Unmarshal(body, &refreshResp); err != nil {
+		t.Fatalf("unmarshal TokenRefreshResponse: %v", err)
+	}
+	return &refreshResp
+}
+
+// refreshStatus drives /refresh like refreshNode but returns the HTTP status
+// instead of failing on a non-200, for tests that expect a refusal.
+func refreshStatus(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit []byte) int {
+	t.Helper()
+	code, _ := refreshAs(t, cpURL, priv, currentBiscuit, "")
+	return code
+}
+
+// refreshAs drives /refresh signing the challenge with priv and sending peerID
+// in the body, and returns the HTTP status and body without judging them.
+func refreshAs(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit []byte, peerID string) (int, []byte) {
+	t.Helper()
+	resp := postRefresh(t, cpURL, priv, currentBiscuit, peerID)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /refresh body: %v", err)
+	}
+	return resp.StatusCode, body
+}
+
+// postRefresh posts a signed TokenRefreshRequest for priv's peer. peerID, when
+// non-empty, is sent in the request body's peer_id field.
+func postRefresh(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit []byte, peerID string) *http.Response {
+	t.Helper()
+
 	timestamp := time.Now().UnixMilli()
 	pid, err := peer.IDFromPrivateKey(priv)
 	if err != nil {
@@ -130,6 +173,7 @@ func refreshNode(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit
 	reqData, err := proto.Marshal(&api.TokenRefreshRequest{
 		Timestamp:          timestamp,
 		ChallengeSignature: sig,
+		PeerId:             peerID,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -146,17 +190,7 @@ func refreshNode(t *testing.T, cpURL string, priv crypto.PrivKey, currentBiscuit
 	if err != nil {
 		t.Fatalf("/refresh failed: %v", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("/refresh status %s: %s", resp.Status, string(body))
-	}
-
-	var refreshResp api.TokenRefreshResponse
-	if err := proto.Unmarshal(body, &refreshResp); err != nil {
-		t.Fatalf("unmarshal TokenRefreshResponse: %v", err)
-	}
-	return &refreshResp
+	return resp
 }
 
 // assertNear fails unless got is within a second of want, absorbing the

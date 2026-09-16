@@ -72,6 +72,13 @@ type EnrolledNode struct {
 	EnrolledAt time.Time
 	ExpiresAt  time.Time
 	Banned     bool
+	// AutonomousRecovery lets /refresh re-issue this node's biscuit after the
+	// key that signed it has been retired, on proof of possession alone. Off
+	// by default: without it a bootstrap node offline past the key grace
+	// period needs an operator to mint a new token, which is what stops a
+	// forgotten or stolen machine from rejoining on its own. Only ever set
+	// server-side, from the token that enrolled the node or by an admin.
+	AutonomousRecovery bool
 }
 
 // CheckAdmission reports whether the control plane may still serve this node.
@@ -100,6 +107,20 @@ type BootstrapToken struct {
 	Description string
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
+	// RevokedAt is set by RevokeBootstrapToken - a soft revoke, distinct from
+	// natural expiry, since enrollment_requests.token_id has a foreign key
+	// into this table and a hard delete would break that trail. Nil means
+	// never revoked.
+	RevokedAt *time.Time
+	// AutonomousRecovery is copied onto every node this token enrolls; see
+	// EnrolledNode.AutonomousRecovery.
+	AutonomousRecovery bool
+}
+
+// IsRevoked reports whether the token has been explicitly revoked, as
+// opposed to merely expired or usage-exhausted.
+func (t *BootstrapToken) IsRevoked() bool {
+	return t.RevokedAt != nil
 }
 
 // EnrollmentRequest represents a pending or resolved node registration request (CSR).
@@ -169,6 +190,10 @@ type Store interface {
 	// IsNodeBanned checks if a node is currently banned.
 	IsNodeBanned(ctx context.Context, peerID string) (bool, error)
 
+	// SetNodeAutonomousRecovery toggles EnrolledNode.AutonomousRecovery.
+	// Returns ErrNotFound if no such node is enrolled.
+	SetNodeAutonomousRecovery(ctx context.Context, peerID string, enabled bool) error
+
 	// SetIdentityBanned bans or unbans an enrolled OIDC identity, keyed as
 	// "issuer|subject". A node ban is keyed on a self-generated peer id, so
 	// this is what makes a ban survive keypair regeneration.
@@ -203,6 +228,13 @@ type Store interface {
 
 	// IncrementBootstrapTokenUsage increments the usage count of a token.
 	IncrementBootstrapTokenUsage(ctx context.Context, id string) error
+
+	// RevokeBootstrapToken soft-revokes a token by setting its RevokedAt, so
+	// HandleEnroll refuses it even though it may still be within its TTL and
+	// usage count. Idempotent: revoking an already-revoked or unknown token
+	// is not an error - callers that need to distinguish "unknown" first
+	// look the token up with GetBootstrapToken.
+	RevokeBootstrapToken(ctx context.Context, id string) error
 
 	// CreateEnrollmentRequest saves a new pending enrollment request.
 	CreateEnrollmentRequest(ctx context.Context, req *EnrollmentRequest) error

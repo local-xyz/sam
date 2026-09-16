@@ -244,6 +244,14 @@ message TokenRefreshRequest {
   bytes challenge_signature = 1;
   // Unix milliseconds. Must be within the control plane's freshness window.
   int64 timestamp = 2;
+  // The caller's peer ID. Optional: the control plane normally reads it
+  // from the verified biscuit. It is consulted only when the biscuit's
+  // signing key has been retired, so the biscuit cannot be verified: the
+  // control plane then looks up the enrolled node record by this ID and,
+  // if the node was opted in to autonomous recovery, accepts the request
+  // when the presented biscuit is byte-identical to the last one it
+  // issued and the challenge verifies against the stored public key.
+  string peer_id = 3;
 }
 
 message TokenRefreshResponse {

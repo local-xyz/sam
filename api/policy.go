@@ -19,17 +19,6 @@ const (
 	SystemAuthenticated = "sam:system:authenticated"
 )
 
-var (
-	// ValidMemberPrefixes defines the allowed identity prefixes in policy configuration.
-	ValidMemberPrefixes = map[string]struct{}{
-		FactUser:  {},
-		FactGroup: {},
-		FactEmail: {},
-		FactNode:  {},
-		FactAgent: {},
-	}
-)
-
 type ServiceConfig struct {
 	Type        string            `yaml:"type"` // e.g., "mcp", "inference"
 	Name        string            `yaml:"name"`

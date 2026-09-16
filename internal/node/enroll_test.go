@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -70,7 +71,16 @@ func startMockRouterWithKey(t *testing.T, cpPriv ed25519.PrivateKey, role string
 
 	h.SetStreamHandler(api.AuthProtocolID, func(s network.Stream) {
 		defer func() { _ = s.Close() }()
-		data, _ := proto.Marshal(&api.AuthResponse{Success: true, Biscuit: routerBiscuit})
+		reader := msgio.NewVarintReaderSize(s, 1024*64)
+		msg, err := reader.ReadMsg()
+		if err != nil {
+			return
+		}
+		reader.ReleaseMsg(msg)
+		data, err := proto.Marshal(&api.AuthResponse{Success: true, Biscuit: routerBiscuit})
+		if err != nil {
+			return
+		}
 		_ = msgio.NewVarintWriter(s).WriteMsg(data)
 	})
 
@@ -231,6 +241,163 @@ func TestStartRecoversStaleIdentityViaRefreshToken(t *testing.T) {
 	// not only persisted: the static relay setup runs right after recovery.
 	if len(node.config.RouterAddrs) != 1 || node.config.RouterAddrs[0].String() != routerAddr {
 		t.Errorf("recovered router addresses not adopted: got %v, want %s", node.config.RouterAddrs, routerAddr)
+	}
+}
+
+// TestStartRecoversStaleIdentityViaAutonomousRefresh covers #367 from the
+// node's side: a bootstrap node has no OIDC refresh grant, so when its
+// stored identity is signed by a retired key the only silent recovery is
+// /refresh with peer_id set, which the control plane honours if the operator
+// opted the node in. The node must send peer_id and adopt the result.
+func TestStartRecoversStaleIdentityViaAutonomousRefresh(t *testing.T) {
+	cpPub, cpPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stalePriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	routerAddr := startMockRouterWithKey(t, cpPriv, api.RoleRouter)
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	privKey := GetOrGenerateKey(store)
+	wantPeerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mint := func(priv ed25519.PrivateKey, peerID string) []byte {
+		builder := biscuit.NewBuilder(priv)
+		for _, f := range []biscuit.Fact{
+			{Predicate: biscuit.Predicate{Name: api.FactNode, IDs: []biscuit.Term{biscuit.String(peerID)}}},
+			{Predicate: biscuit.Predicate{Name: api.FactRole, IDs: []biscuit.Term{biscuit.String(api.RoleNode)}}},
+			{Predicate: biscuit.Predicate{Name: api.FactExpiration, IDs: []biscuit.Term{biscuit.Date(time.Now().Add(24 * time.Hour))}}},
+		} {
+			if err := builder.AddAuthorityFact(f); err != nil {
+				t.Fatalf("failed to add fact: %v", err)
+			}
+		}
+		tok, err := builder.Build()
+		if err != nil {
+			t.Fatalf("failed to build biscuit: %v", err)
+		}
+		b, err := tok.Serialize()
+		if err != nil {
+			t.Fatalf("failed to serialize biscuit: %v", err)
+		}
+		return b
+	}
+
+	staleBiscuit := mint(stalePriv, wantPeerID.String())
+	if err := store.SaveIdentity(staleBiscuit); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mock control plane: /refresh behaves like the opted-in fallback - it
+	// cannot verify the bearer, finds the node by peer_id, checks the bearer
+	// is the last one it issued and the challenge is signed by the node key.
+	var mu sync.Mutex
+	var gotPeerID string
+	var gotBearer []byte
+	cpMux := http.NewServeMux()
+	cpMux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
+		bearer, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if err != nil {
+			http.Error(w, "bad bearer", http.StatusBadRequest)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read /refresh body: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		var req api.TokenRefreshRequest
+		if err := proto.Unmarshal(body, &req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		gotPeerID, gotBearer = req.PeerId, bearer
+		mu.Unlock()
+		if req.PeerId != wantPeerID.String() || !bytes.Equal(bearer, staleBiscuit) {
+			http.Error(w, "Invalid biscuit", http.StatusUnauthorized)
+			return
+		}
+		ok, err := privKey.GetPublic().Verify(api.RefreshChallenge(req.PeerId, req.Timestamp), req.ChallengeSignature)
+		if err != nil || !ok {
+			http.Error(w, "Challenge verification failed", http.StatusUnauthorized)
+			return
+		}
+		data, err := proto.Marshal(&api.TokenRefreshResponse{
+			BiscuitToken: mint(cpPriv, req.PeerId),
+			ExpiresAt:    time.Now().Add(24 * time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Errorf("marshal TokenRefreshResponse: %v", err)
+			http.Error(w, "internal", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		if _, err := w.Write(data); err != nil {
+			t.Errorf("write /refresh response: %v", err)
+		}
+	})
+	cpMux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("/register must not be hit: a bootstrap node has no OIDC grant to re-enroll with")
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	cpSrv := httptest.NewServer(cpMux)
+	defer cpSrv.Close()
+
+	if err := store.SaveControlPlaneURL(cpSrv.URL); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveMeshConfig(cpPub, []string{routerAddr}); err != nil {
+		t.Fatal(err)
+	}
+
+	node, err := NewSamNode(Options{
+		PrivKey:            privKey,
+		Store:              store,
+		ControlPlanePubKey: cpPub,
+		ListenAddrs:        []string{"/ip4/127.0.0.1/tcp/0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := node.Start(ctx); err != nil {
+		t.Fatalf("Start should have recovered the stale identity via /refresh, got: %v", err)
+	}
+
+	mu.Lock()
+	if gotPeerID != wantPeerID.String() {
+		t.Errorf("/refresh peer_id: got %q, want %q", gotPeerID, wantPeerID)
+	}
+	if !bytes.Equal(gotBearer, staleBiscuit) {
+		t.Error("/refresh must present the stored (stale) biscuit for the control plane to byte-match")
+	}
+	mu.Unlock()
+
+	if err := identity.VerifyBiscuitRole(node.GetIdentity(), cpPub, api.RoleNode, time.Second); err != nil {
+		t.Errorf("recovered identity does not verify under the current CP key: %v", err)
+	}
+	stored, err := store.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, node.GetIdentity()) {
+		t.Error("in-memory identity and stored identity diverged after recovery")
 	}
 }
 

@@ -16,6 +16,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -119,6 +120,8 @@ func TestEnrolledNodeRoundTripsEveryField(t *testing.T) {
 		Labels:         map[string]string{"region": "emea"},
 		EnrolledAt:     time.Now().Add(-time.Hour),
 		ExpiresAt:      time.Now().Add(time.Hour),
+		// Non-default so the round trip proves the column is read back.
+		AutonomousRecovery: true,
 	}
 	// Banned is never set by enrollment; a node cannot un-ban itself by
 	// re-enrolling. TestReEnrollmentKeepsAnExistingBan covers that.
@@ -143,6 +146,59 @@ func TestEnrolledNodeRoundTripsEveryField(t *testing.T) {
 		t.Fatalf("ListNodes returned %d nodes, want 1", len(listed))
 	}
 	requireFieldsRoundTrip(t, want, &listed[0], "Banned")
+}
+
+// Autonomous recovery is a per-node, server-side opt-in: it must default
+// off, flip on and off via SetNodeAutonomousRecovery, and report ErrNotFound
+// for a peer that was never enrolled (so an admin toggle can 404 instead of
+// silently updating zero rows).
+func TestSetNodeAutonomousRecovery(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	node := &EnrolledNode{
+		PeerID:         "12D3KooWRecover",
+		PublicKey:      []byte("pub"),
+		Biscuit:        []byte("biscuit"),
+		Role:           api.RoleRouter,
+		EnrollmentType: "BOOTSTRAP",
+		EnrolledAt:     time.Now(),
+	}
+	if err := store.EnrollNode(ctx, node); err != nil {
+		t.Fatalf("EnrollNode: %v", err)
+	}
+	got, err := store.GetNode(ctx, node.PeerID)
+	if err != nil {
+		t.Fatalf("GetNode: %v", err)
+	}
+	if got.AutonomousRecovery {
+		t.Fatal("AutonomousRecovery must default to false")
+	}
+
+	if err := store.SetNodeAutonomousRecovery(ctx, node.PeerID, true); err != nil {
+		t.Fatalf("SetNodeAutonomousRecovery(true): %v", err)
+	}
+	got, err = store.GetNode(ctx, node.PeerID)
+	if err != nil {
+		t.Fatalf("GetNode after enable: %v", err)
+	}
+	if !got.AutonomousRecovery {
+		t.Fatal("SetNodeAutonomousRecovery(true) did not persist")
+	}
+	if err := store.SetNodeAutonomousRecovery(ctx, node.PeerID, false); err != nil {
+		t.Fatalf("SetNodeAutonomousRecovery(false): %v", err)
+	}
+	got, err = store.GetNode(ctx, node.PeerID)
+	if err != nil {
+		t.Fatalf("GetNode after disable: %v", err)
+	}
+	if got.AutonomousRecovery {
+		t.Fatal("SetNodeAutonomousRecovery(false) did not persist")
+	}
+
+	if err := store.SetNodeAutonomousRecovery(ctx, "12D3KooWNobody", true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SetNodeAutonomousRecovery(unknown peer) = %v, want ErrNotFound", err)
+	}
 }
 
 // A ban is the mesh's way of turning a node off. Re-enrolling must not clear
@@ -201,8 +257,12 @@ func TestBootstrapTokenRoundTripsEveryField(t *testing.T) {
 		Description: "a description",
 		CreatedAt:   time.Now().Add(-time.Hour),
 		ExpiresAt:   time.Now().Add(time.Hour),
+		// Non-default so the round trip proves the column is read back.
+		AutonomousRecovery: true,
 	}
-	requireAllFieldsSet(t, want)
+	// RevokedAt is never set at creation - only RevokeBootstrapToken sets it,
+	// covered separately below.
+	requireAllFieldsSet(t, want, "RevokedAt")
 
 	if err := store.SaveBootstrapToken(ctx, want); err != nil {
 		t.Fatalf("SaveBootstrapToken: %v", err)
@@ -213,6 +273,9 @@ func TestBootstrapTokenRoundTripsEveryField(t *testing.T) {
 		t.Fatalf("GetBootstrapToken: %v", err)
 	}
 	requireFieldsRoundTrip(t, want, got)
+	if got.IsRevoked() {
+		t.Error("a freshly saved token must not start out revoked")
+	}
 
 	listed, err := store.ListBootstrapTokens(ctx)
 	if err != nil {
@@ -222,6 +285,36 @@ func TestBootstrapTokenRoundTripsEveryField(t *testing.T) {
 		t.Fatalf("ListBootstrapTokens returned %d, want 1", len(listed))
 	}
 	requireFieldsRoundTrip(t, want, &listed[0])
+
+	if err := store.RevokeBootstrapToken(ctx, want.ID); err != nil {
+		t.Fatalf("RevokeBootstrapToken: %v", err)
+	}
+	revoked, err := store.GetBootstrapToken(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("GetBootstrapToken after revoke: %v", err)
+	}
+	if !revoked.IsRevoked() {
+		t.Fatal("RevokedAt was not persisted by RevokeBootstrapToken")
+	}
+
+	// Idempotent: revoking an already-revoked token is not an error and does
+	// not un-set RevokedAt.
+	if err := store.RevokeBootstrapToken(ctx, want.ID); err != nil {
+		t.Fatalf("RevokeBootstrapToken (second call): %v", err)
+	}
+	revokedAgain, err := store.GetBootstrapToken(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("GetBootstrapToken after second revoke: %v", err)
+	}
+	if !revokedAgain.IsRevoked() {
+		t.Error("a second RevokeBootstrapToken call must not un-revoke the token")
+	}
+
+	// Revoking an unknown id is also not an error - the HTTP layer is what
+	// distinguishes "unknown" via a preceding GetBootstrapToken.
+	if err := store.RevokeBootstrapToken(ctx, "no-such-token"); err != nil {
+		t.Errorf("RevokeBootstrapToken(unknown id) = %v, want nil", err)
+	}
 }
 
 func TestEnrollmentRequestRoundTripsEveryField(t *testing.T) {

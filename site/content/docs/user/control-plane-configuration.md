@@ -26,7 +26,7 @@ The Control Plane is responsible for bridging user identities from trusted OIDC 
 | `--biscuit-ttl` | *None* | `24h` | Lifespan minted into every issued Biscuit token. Capped to the OIDC token's own expiry when shorter. |
 | `--oidc-session-ttl` | *None* | `2160h` (90 days) | How long an OIDC enrollment stays refreshable before the identity must re-authenticate with the OIDC provider. Shorter values keep the provider authoritative for offboarding, at the cost of more frequent interactive re-enrollment. |
 | `--key-rotation-interval` | *None* | `24h` | Key rotation interval (e.g. `24h`). `0s` disables rotation. |
-| `--key-grace-period` | *None* | `1h` | Key grace period for rotated keys. |
+| `--key-grace-period` | *None* | `1h` | How long a rotated-out signing key stays accepted. Once it is retired, Biscuits it signed can no longer be verified or refreshed; see [Signing-Key Retirement and Recovery](#signing-key-retirement-and-recovery). |
 | `--lease-duration` | *None* | `15m` | Router lease registration TTL. |
 
 ---
@@ -175,7 +175,7 @@ To enforce centralized access control without sacrificing offline verification p
    All minted Biscuit tokens are cryptographically bound to a strict 24-hour expiration. Peers verify this expiration locally without hitting the Control Plane.
 2. **Long-Lived Sessions (The Right to Refresh)**:
    * **OIDC Interactive Enrollment**: 90-day database session limit. After 90 days, the user must re-enroll interactively.
-   * **Bootstrap Flow (Headless Nodes/Routers)**: Infinite session limit (sessions never expire).
+   * **Bootstrap Flow (Headless Nodes/Routers)**: Infinite session limit (sessions never expire). In practice the signing key's grace period bounds how long such a node can stay offline and still refresh; see [Signing-Key Retirement and Recovery](#signing-key-retirement-and-recovery).
 
 ### Proactive Refresh Lifecycle
 
@@ -187,6 +187,44 @@ Nodes and Routers run a background task that periodically checks the remaining B
 The bootstrap surface requires the same proof of possession end to end. `POST /enroll` carries a signed timestamp challenge in the request body (`timestamp`/`challenge_signature`, and `peer_id` must be derived from the submitted `public_key`), so a bootstrap token alone can never mint — or re-fetch — another peer's Biscuit. `GET /enroll/status` answers only when the caller signs the peer-bound challenge with that same key, sent in the `X-Sam-Challenge-Ts` and `X-Sam-Challenge-Sig` headers (headers rather than query parameters, so signatures stay out of access logs). Anything else — no signature, a stale timestamp, another key, an unknown peer — receives a uniform `401`, so an approved enrollment's Biscuit is only ever released to the enrollee itself.
 
 All three challenges share one shape — the UTF-8 bytes of `sam:<endpoint>:<peer_id>:<unix-millis>` (`sam:enroll:…`, `sam:enroll-status:…`, `sam:refresh:…`), signed by the peer's identity key and accepted within a ±5-minute freshness window. Binding the peer and the endpoint into the signed payload means a signature captured from any one request verifies nowhere else.
+
+### Signing-Key Retirement and Recovery
+
+Every `--key-rotation-interval` the Control Plane mints a new signing key. The previous key stays accepted for `--key-grace-period`, then it is retired: Biscuits it signed can no longer be verified by anyone, including the Control Plane. A node whose Biscuit is signed by a retired key is refused on `/refresh` (`401`), fails its role check at daemon start, and — for a router — has its lease renewal rejected. This is deliberate: the grace period is the deadline after which a node that has gone quiet cannot come back on its own, so a forgotten or stolen machine does not rejoin the mesh unnoticed.
+
+How a node gets past that deadline depends on how it was enrolled.
+
+* **OIDC nodes** recover on their own. The daemon exchanges its stored refresh grant for a fresh ID token and re-enrolls under the current key, keeping its PeerID. The identity provider stays authoritative: revoking the grant there ends this.
+* **Bootstrap nodes and routers** (headless enrollment) have no such grant. By default they need an operator: mint a new bootstrap token and re-run `sam-node join` (or restart the router with the new token). `POST /enroll` for a peer that is already approved re-mints a fresh Biscuit under the active key instead of replaying the stored one — the role and labels come from the enrolled node record, never from the request, the peer must still prove possession of its key, a banned peer is refused, and the re-enrollment consumes one use of the token. The token's `max_usages` is therefore the operator's cap on how many times a given node can be brought back this way.
+
+#### Autonomous recovery (opt-in)
+
+For fleets where an operator round-trip per stale node is impractical, a bootstrap node can be allowed to recover on proof of possession alone. This is a per-node flag, `autonomous_recovery`, held only on the Control Plane's node record and never asserted by the node. It is **off by default**: a node carrying it can always renew on its own private key, so that key effectively becomes a credential that never expires. Only a ban (`POST /admin/revoke`) stops it.
+
+Set it either when minting the bootstrap token — every node that token enrolls inherits it — or per node afterwards:
+
+```bash
+# At mint time (admin only): nodes enrolled with this token may recover autonomously
+curl -X POST -H "Authorization: Bearer <your-admin-token>" -H "Content-Type: application/json" \
+  -d '{"role": "sam:role:router", "ttl_hours": 24, "max_usages": 3, "autonomous_recovery": true}' \
+  http://<control-plane-ip>:8080/admin/bootstrap-tokens
+
+# Per node, for one that is already enrolled (toggle back with "enabled": false)
+curl -X POST -H "Authorization: Bearer <your-admin-token>" -H "Content-Type: application/json" \
+  -d '{"enabled": true}' \
+  http://<control-plane-ip>:8080/admin/nodes/<peer-id>/autonomous-recovery
+```
+
+The console shows the flag in the **Recovery** column of the Nodes and Bootstrap Tokens views, with an enable/disable action for administrators.
+
+With the flag set, `/refresh` accepts a Biscuit it can no longer verify when all of the following hold:
+
+1. the request carries the node's `peer_id`, and an enrolled record exists for it with `autonomous_recovery` on;
+2. the presented Biscuit is byte-for-byte the last one the Control Plane issued to that node — a replayed, superseded Biscuit is refused, and this is what authenticates the Biscuit in place of the signature that cannot be checked;
+3. the fresh challenge is signed by the node's registered private key;
+4. the node is not banned and its session has not expired.
+
+The new Biscuit is minted under the active key with the role and labels from the node record. Until steps 1–3 all succeed, a request through this path is answered exactly like any other bad Biscuit, so the fallback does not reveal which peer IDs are enrolled. Nodes and routers send `peer_id` on every refresh; when the Biscuit verifies normally it is only cross-checked against the token.
 
 ### Administrative Revocation
 
@@ -241,6 +279,15 @@ This returns a JSON response containing the plaintext token:
 }
 ```
 
+The request also accepts `"autonomous_recovery": true` (admin only), which lets every node enrolled with the token refresh its Biscuit after the signing key that issued it has been retired; see [Autonomous recovery](#autonomous-recovery-opt-in) before turning it on.
+
+A token that is no longer wanted — a multi-use token being decommissioned early, or one that leaked — can be revoked before it expires. Revocation is a soft state on the token (it stays listed, marked revoked, so the audit trail of what it enrolled is kept), is idempotent, and is enforced on every `/enroll`, including re-enrollment of a node it previously approved:
+
+```bash
+curl -X DELETE -H "Authorization: Bearer <your-admin-token>" \
+  http://<control-plane-ip>:8080/admin/bootstrap-tokens/<token-id>
+```
+
 ### Step 2: Request Enrollment on the Node
 
 Run the node `join` command with the generated token:
@@ -269,4 +316,8 @@ curl -X POST \
 ```
 
 Alternatively, you can boot the control plane with `--auto-approve-enrollment` to automatically approve all valid bootstrap token requests without manual gates.
+
+### Re-enrolling a node that is already approved
+
+Running `sam-node join` again for a peer the Control Plane has already approved — after `sam-node reset`, or because its Biscuit was signed by a key that has since been retired — does not go back through the approval queue. As long as the token is valid, unrevoked and has usages left, the peer proves possession of the same key, its role matches the token's, and it is not banned, `POST /enroll` mints a fresh Biscuit under the current signing key from the stored node record and returns it immediately. This is the manual recovery path described in [Signing-Key Retirement and Recovery](#signing-key-retirement-and-recovery); no database intervention is needed.
 

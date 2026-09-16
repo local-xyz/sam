@@ -354,13 +354,21 @@ func (n *SamNode) Start(ctx context.Context) error {
 			}
 			if roleErr != nil {
 				// Stale identity (e.g. signing key rotated past its grace
-				// period while offline): try silent re-enrollment with the
-				// stored refresh token before giving up.
-				logger.Warnf("Loaded identity fails role requirement %q: %v; attempting recovery via stored refresh token", n.config.RequiredRole, roleErr)
-				if recErr := n.ReEnrollWithRefreshToken(ctx); recErr != nil {
-					return fmt.Errorf("loaded identity fails role requirement %q (refresh-token recovery failed: %v): %w", n.config.RequiredRole, recErr, roleErr)
+				// period while offline). Two silent recoveries are tried
+				// before giving up: /refresh, which the control plane honours
+				// on proof of possession alone if an operator opted this node
+				// in to autonomous recovery (the only path a bootstrap node
+				// has), then re-enrollment with the stored OIDC refresh token.
+				logger.Warnf("Loaded identity fails role requirement %q: %v; attempting recovery", n.config.RequiredRole, roleErr)
+				if refreshErr := n.RefreshEnrollment(ctx); refreshErr == nil {
+					logger.Info("Identity recovered via autonomous refresh.")
+				} else {
+					logger.Warnf("Autonomous refresh refused (%v); attempting recovery via stored refresh token", refreshErr)
+					if recErr := n.ReEnrollWithRefreshToken(ctx); recErr != nil {
+						return fmt.Errorf("loaded identity fails role requirement %q (autonomous refresh: %v; refresh-token recovery: %v): %w", n.config.RequiredRole, refreshErr, recErr, roleErr)
+					}
+					logger.Info("Identity recovered via refresh-token re-enrollment.")
 				}
-				logger.Info("Identity recovered via refresh-token re-enrollment.")
 				// Re-enrollment persisted the response's router addresses; adopt
 				// them so the static relay setup below doesn't use stale ones.
 				if _, storedAddrs, loadErr := n.Store.LoadMeshConfig(); loadErr == nil {
@@ -934,21 +942,7 @@ func (n *SamNode) performRouterAuthHandshake(s network.Stream, biscuitBytes []by
 	// Enforce role("router") inside the biscuit, under the key that verified:
 	// with several valid keys loaded (rotation grace) the first is not
 	// necessarily the signer.
-	authorizer, err := b.Authorizer(verifyingKey, identity.AuthorizerOptions(n.BiscuitTimeout)...)
-	if err != nil {
-		return false, fmt.Errorf("authorizer instantiation failed: %w", err)
-	}
-
-	authorizer.AddCheck(biscuit.Check{Queries: []biscuit.Rule{
-		{
-			Body: []biscuit.Predicate{
-				{Name: api.FactRole, IDs: []biscuit.Term{biscuit.String(api.RoleRouter)}},
-			},
-		},
-	}})
-	authorizer.AddPolicy(api.AllowIfTruePolicy)
-
-	if err := authorizer.Authorize(); err != nil {
+	if err := identity.RequireRole(b, verifyingKey, api.RoleRouter, n.BiscuitTimeout); err != nil {
 		return false, fmt.Errorf("%w: remote peer lacks router authorization role: %w", ErrFatalAuth, err)
 	}
 
@@ -1084,10 +1078,14 @@ func (n *SamNode) RefreshEnrollment(ctx context.Context) error {
 		return fmt.Errorf("failed to generate signature: %w", err)
 	}
 
-	// 4. Construct request
+	// 4. Construct request. peer_id lets the control plane find this node's
+	// record when the biscuit's signing key has been retired and the biscuit
+	// itself can no longer be verified (autonomous recovery, opt-in
+	// server-side); it is cross-checked against the biscuit otherwise.
 	req := &api.TokenRefreshRequest{
 		ChallengeSignature: sig,
 		Timestamp:          timestamp,
+		PeerId:             peerID.String(),
 	}
 	reqData, err := proto.Marshal(req)
 	if err != nil {
@@ -1154,6 +1152,7 @@ func (n *SamNode) RefreshEnrollment(ctx context.Context) error {
 	if err := n.Store.SaveIdentity(refreshResp.BiscuitToken); err != nil {
 		return fmt.Errorf("failed to save refreshed identity: %w", err)
 	}
+	n.SetIdentityCache(refreshResp.BiscuitToken)
 	if err := n.Store.SaveIdentityExpiration(refreshResp.ExpiresAt); err != nil {
 		return fmt.Errorf("failed to save refreshed expiration: %w", err)
 	}
@@ -1582,27 +1581,12 @@ func (n *SamNode) HandleAuthHandshake(s network.Stream) {
 		return
 	}
 
-	b, verifyingKey, err := identity.VerifyBiscuitAndGetKey(exchange.Biscuit, remotePeer, n.getTrustedPublicKeys(), n.BiscuitTimeout)
+	// One verifier call enforces signature, expiry and the authority-block peer
+	// binding, and reports when the admission lapses.
+	expiry, err := identity.VerifyBiscuitAndGetExpiry(exchange.Biscuit, remotePeer, n.getTrustedPublicKeys(), n.BiscuitTimeout)
 	if err != nil {
 		logger.Warnf("[AuthN] Authorization failed for %s: %v", remotePeer, err)
 		return
-	}
-
-	// 4. Enforce hardware binding: token must include node(<remotePeerID>)
-	if err := identity.RequireAuthorityBinding(b, remotePeer); err != nil {
-		logger.Warnf("[AuthN] %v", err)
-		return
-	}
-
-	expiry := time.Now().Add(n.BiscuitTimeout)
-	if authorizer, authErr := b.Authorizer(verifyingKey, identity.AuthorizerOptions(n.BiscuitTimeout)...); authErr == nil {
-		identity.EnforceExpiration(authorizer)
-		authorizer.AddPolicy(api.AllowIfTruePolicy)
-		if authErr := authorizer.Authorize(); authErr == nil {
-			if e, expErr := identity.ExpirationOf(authorizer); expErr == nil {
-				expiry = e
-			}
-		}
 	}
 
 	n.authPeers.Store(remotePeer, expiry)
