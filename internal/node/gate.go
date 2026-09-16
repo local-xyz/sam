@@ -50,6 +50,15 @@ func (g *nodeConnGate) InterceptPeerDial(p peer.ID) (allow bool) {
 
 // InterceptAddrDial ensures we only dial specific approved networks
 func (g *nodeConnGate) InterceptAddrDial(p peer.ID, m multiaddr.Multiaddr) (allow bool) {
+	if g.node.config.RouterRelayOnly && !hasCircuit(m) {
+		for _, router := range g.node.config.RouterAddrs {
+			info, err := peer.AddrInfoFromP2pAddr(router)
+			if err == nil && info.ID == p {
+				return true
+			}
+		}
+		return false
+	}
 	return true
 }
 

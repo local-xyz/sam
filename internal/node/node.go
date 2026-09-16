@@ -424,7 +424,7 @@ func (n *SamNode) Start(ctx context.Context) error {
 	}
 
 	// If we have routers, configure them as our static fallback relays for NAT hole-punching
-	if len(staticRelays) > 0 {
+	if len(staticRelays) > 0 && !n.config.RouterRelayOnly {
 		n.currentRelays = staticRelays
 		opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(
 			func(ctx context.Context, numPeers int) <-chan peer.AddrInfo {
@@ -847,8 +847,11 @@ func (n *SamNode) ConnectAndAuthWithRouter(ctx context.Context, addr multiaddr.M
 			continue
 		}
 		_ = s.SetDeadline(time.Now().Add(5 * time.Second))
-
+		// Stream I/O itself does not observe the context. Cancel an in-progress
+		// handshake immediately instead of waiting for the stream deadline.
+		stopReset := context.AfterFunc(replicaCtx, func() { _ = s.Reset() })
 		success, err := n.performRouterAuthHandshake(s, biscuitBytes, addrInfo.ID)
+		stopReset()
 		if err != nil {
 			_ = s.Reset()
 			cancel()
@@ -2116,6 +2119,14 @@ func (n *SamNode) StartIngressServer(ctx context.Context) error {
 // their IP belongs to the router, and dropping one would strand a node behind
 // NAT.
 func (n *SamNode) announceFilter(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+	if n.config.RouterRelayOnly {
+		circuit := multiaddr.StringCast("/p2p-circuit")
+		result := make([]multiaddr.Multiaddr, 0, len(n.config.RouterAddrs))
+		for _, router := range n.config.RouterAddrs {
+			result = append(result, router.Encapsulate(circuit))
+		}
+		return result
+	}
 	announcePrivate := n.config.AnnouncePrivateAddrs == nil || *n.config.AnnouncePrivateAddrs
 	if n.config.AllowLoopback && announcePrivate {
 		return addrs

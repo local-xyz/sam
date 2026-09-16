@@ -50,9 +50,12 @@ type Options struct {
 	DiscoveryInterval string
 	ListenAddrs       []string
 	EnableRelay       bool
-	NodeConfig        *NodeConfigComplete
-	KeyGracePeriod    time.Duration
-	AllowLoopback     bool
+	// RouterRelayOnly advertises provisioned router circuits and forbids direct
+	// peer dials. The caller must obtain and renew reservations before publishing.
+	RouterRelayOnly bool
+	NodeConfig      *NodeConfigComplete
+	KeyGracePeriod  time.Duration
+	AllowLoopback   bool
 	// AnnouncePrivateAddrs controls whether RFC1918/ULA addresses are published
 	// to the mesh. Nil means true: private meshes reach each other over exactly
 	// those addresses. Set false on nodes that are only reachable via routers or
@@ -74,6 +77,8 @@ type Options struct {
 	DiscoveryConcurrency int
 	// RequiredRole restricts enrollment and startup to only accept tokens containing this role.
 	RequiredRole string
+	// RequirePeerIdentity verifies the provider credential even without label constraints.
+	RequirePeerIdentity bool
 	// PolicySyncInterval specifies how often the node syncs the mesh policy from the control plane.
 	PolicySyncInterval time.Duration
 	// PolicySyncJitter specifies the maximum jitter delay when scheduling policy syncs on event broadcasts.

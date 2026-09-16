@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/sam/api"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -40,6 +41,8 @@ var errTooManyCommandSessions = errors.New("too many concurrent sessions to comm
 // MCPService extends baseService to handle MCP protocol proxying.
 type MCPService struct {
 	baseService
+	// Optional per-peer transport installed by the debug mobile loopback bridge.
+	backendForPeer func(peer.ID) (mcp.Transport, error)
 
 	toolsMu      sync.Mutex
 	cachedTools  []string
@@ -139,6 +142,9 @@ func (m *MCPService) Teardown() error {
 // per-session id space. Cost: a fresh process per call instead of one
 // long-lived one, so slow-starting backends pay startup repeatedly.
 func (m *MCPService) backendTransport() (mcp.Transport, error) {
+	if m.backendForPeer != nil {
+		return m.backendForPeer("")
+	}
 	switch x := m.backend.(type) {
 	case *api.RegisterServiceRequest_TargetUrl:
 		return &mcp.StreamableClientTransport{Endpoint: x.TargetUrl}, nil
@@ -229,6 +235,9 @@ func (m *MCPService) HandleStreamPassThrough(s network.Stream) {
 	}()
 
 	backendTransport, err := m.backendTransport()
+	if m.backendForPeer != nil {
+		backendTransport, err = m.backendForPeer(s.Conn().RemotePeer())
+	}
 	if err != nil {
 		logger.Errorf("[MCPService] %s: %v", m.info.Name, err)
 		return

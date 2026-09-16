@@ -35,13 +35,23 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
+// nodeStartup reserves the singleton while initialization runs without mu.
+// done closes only after initialization has either published or fully cleaned up.
+type nodeStartup struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 var (
-	activeNode  *node.SamNode
-	activeStore *node.Store
-	cancelFunc  context.CancelFunc
-	sidecarSrv  *http.Server
-	unauthSrv   *http.Server
-	mu          sync.Mutex
+	pendingStart *nodeStartup
+	// activeModeStop lets optional runtime modes retain lifecycle ownership. Called under mu.
+	activeModeStop func() error
+	activeNode     *node.SamNode
+	activeStore    *node.Store
+	cancelFunc     context.CancelFunc
+	sidecarSrv     *http.Server
+	unauthSrv      *http.Server
+	mu             sync.Mutex
 
 	logger = golog.Logger("sam-node-ffi")
 )
@@ -86,7 +96,7 @@ func StartNode(configJSON string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if activeNode != nil || unauthSrv != nil {
+	if activeNode != nil || unauthSrv != nil || pendingStart != nil {
 		return errors.New("node is already running")
 	}
 
@@ -276,11 +286,21 @@ func StartNode(configJSON string) error {
 // StopNode stops the node.
 func StopNode() error {
 	mu.Lock()
+	if pendingStart != nil {
+		startup := pendingStart
+		startup.cancel()
+		mu.Unlock()
+		<-startup.done
+		return nil
+	}
 	defer mu.Unlock()
 	return stopNodeInternal()
 }
 
 func stopNodeInternal() error {
+	if activeModeStop != nil {
+		return activeModeStop()
+	}
 	if activeNode == nil && unauthSrv == nil {
 		return errors.New("node is not running")
 	}

@@ -322,7 +322,9 @@ func (n *SamNode) ConnectMCPSession(ctx context.Context, targetPeer peer.ID, tar
 	}
 	logger.Debugf("Opened stream to %s for MCP\n", targetPeer)
 
+	stopCancellation := context.AfterFunc(ctx, func() { _ = s.Reset() })
 	cleanup := func() {
+		stopCancellation()
 		if err := s.Close(); err != nil {
 			logger.Debugf("[MCP] Failed to close stream: %v", err)
 		}
@@ -381,7 +383,7 @@ func (n *SamNode) ConnectMCPSession(ctx context.Context, targetPeer peer.ID, tar
 	// The gate runs when the caller requires labels or when the operator's
 	// egress floor does: a caller that requires nothing is still held to the
 	// floor (checkPeerLabels ANDs both).
-	if len(requiredLabels) > 0 || len(n.egressFloor()) > 0 {
+	if n.config.RequirePeerIdentity || len(requiredLabels) > 0 || len(n.egressFloor()) > 0 {
 		if err := n.checkPeerLabels(resp.Biscuit, targetPeer, requiredLabels); err != nil {
 			cleanup()
 			return nil, nil, err
