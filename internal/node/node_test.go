@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -684,5 +685,56 @@ func TestNewSamNode_DHTOptions(t *testing.T) {
 	}
 	if node.config.DiscoveryConcurrency != 5 {
 		t.Errorf("expected DiscoveryConcurrency to be 5, got %d", node.config.DiscoveryConcurrency)
+	}
+}
+
+// Startup must preserve the failed stage and router address for an embedded
+// caller, which may have no access to the native process's logger.
+func TestStartPreservesRouterConnectionErrors(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	key := GetOrGenerateKey(store)
+	id, err := peer.IDFromPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, signer, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := identity.MintBootstrapBiscuitToken(signer, id, api.RoleNode, time.Now().Add(time.Hour), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveIdentity(token); err != nil {
+		t.Fatal(err)
+	}
+	// Syntactically valid multiaddrs that cannot identify a router. Both failures
+	// must survive the top-level error rather than only the final attempt.
+	addresses := []multiaddr.Multiaddr{
+		multiaddr.StringCast("/ip4/127.0.0.1/tcp/1"),
+		multiaddr.StringCast("/ip4/127.0.0.1/tcp/2"),
+	}
+	n, err := NewSamNode(Options{Store: store, PrivKey: key, ControlPlanePubKey: authority, RouterAddrs: addresses, ListenAddrs: []string{"/ip4/127.0.0.1/tcp/0"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	defer n.Teardown()
+	err = n.Start(ctx)
+	if err == nil {
+		t.Fatal("startup accepted routers without peer IDs")
+	}
+	for _, addr := range addresses {
+		if !strings.Contains(err.Error(), "failed to get AddrInfo from multiaddr "+addr.String()) {
+			t.Errorf("startup lost router failure for %s: %v", addr, err)
+		}
+	}
+	if errors.Is(err, ErrFatalAuth) {
+		t.Fatalf("invalid router address became fatal credential rejection: %v", err)
 	}
 }

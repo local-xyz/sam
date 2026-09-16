@@ -330,7 +330,11 @@ func (n *SamNode) labels() map[string]string {
 
 // Start initializes the libp2p host, DHT, connects to the routers, and starts runtime components.
 func (n *SamNode) Start(ctx context.Context) error {
-	if biscuitBytes := n.GetIdentity(); len(biscuitBytes) > 0 {
+	return n.start(ctx, true)
+}
+
+func (n *SamNode) start(ctx context.Context, recoverIdentity bool) error {
+	if biscuitBytes := n.GetIdentity(); recoverIdentity && len(biscuitBytes) > 0 {
 		// The identity may be signed by any currently valid control plane
 		// key, not only the newest: after a rotation the biscuit's key can
 		// legitimately be in its grace period.
@@ -532,9 +536,11 @@ func (n *SamNode) Start(ctx context.Context) error {
 
 	var authenticated bool
 	var fatalAuthErr error
+	var routerErrors []error
 
 	for _, addr := range n.config.RouterAddrs {
 		if err := n.ConnectAndAuthWithRouter(ctx, addr); err != nil {
+			routerErrors = append(routerErrors, err)
 			logger.Warnf("[AuthN] Failed to bootstrap and auth with router %s: %v", addr, err)
 			if errors.Is(err, ErrFatalAuth) {
 				fatalAuthErr = err
@@ -548,7 +554,7 @@ func (n *SamNode) Start(ctx context.Context) error {
 		if fatalAuthErr != nil {
 			return fmt.Errorf("fatal auth failure: %w", fatalAuthErr)
 		}
-		return fmt.Errorf("failed to authenticate with any router: all connection attempts failed")
+		return fmt.Errorf("failed to authenticate with any router: %w", errors.Join(routerErrors...))
 	}
 
 	if authenticated {
@@ -1051,6 +1057,10 @@ func (e *RefreshError) Error() string {
 
 // RefreshEnrollment trades the expiring biscuit token for a new one using a cryptographic challenge.
 func (n *SamNode) RefreshEnrollment(ctx context.Context) error {
+	return n.refreshEnrollment(ctx, true, nil)
+}
+
+func (n *SamNode) refreshEnrollment(ctx context.Context, terminateOnBan bool, validate func([]byte) error) error {
 	// 1. Fetch current biscuit
 	currentBiscuit, err := n.Store.LoadIdentity()
 	if err != nil {
@@ -1118,7 +1128,7 @@ func (n *SamNode) RefreshEnrollment(ctx context.Context) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusForbidden && terminateOnBan {
 		logger.Errorf("Refresh rejected: Node is banned (403 Forbidden). Initiating hard-kill.")
 		if n.Host != nil {
 			_ = n.Host.Close()
@@ -1146,6 +1156,16 @@ func (n *SamNode) RefreshEnrollment(ctx context.Context) error {
 
 	if refreshResp.ErrorMessage != "" {
 		return fmt.Errorf("refresh error: %s", refreshResp.ErrorMessage)
+	}
+
+	// Embedded callers validate the replacement before changing persisted identity.
+	if validate != nil {
+		if refreshResp.ExpiresAt <= time.Now().Unix() {
+			return fmt.Errorf("refreshed identity expiration is invalid")
+		}
+		if err := validate(refreshResp.BiscuitToken); err != nil {
+			return fmt.Errorf("invalid refreshed identity: %w", err)
+		}
 	}
 
 	// Save new biscuit and its expiration

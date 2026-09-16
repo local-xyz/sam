@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,9 +71,10 @@ func newSharedMesh(parent context.Context, cfg SharedMeshConfig) (r *sharedMesh,
 		return nil, errors.New("dataDir must be an absolute private directory")
 	}
 	u, e := url.Parse(cfg.BootstrapURL)
-	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || cfg.JoinToken == "" {
-		return nil, errors.New("bootstrapUrl and joinToken are required")
+	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("bootstrapUrl must be an HTTP or HTTPS URL")
 	}
+	cfg.BootstrapURL = strings.TrimRight(cfg.BootstrapURL, "/")
 	store, err := node.NewStore(filepath.Join(cfg.DataDir, "shared-mesh-v1"))
 	if err != nil {
 		return nil, err
@@ -82,81 +84,9 @@ func newSharedMesh(parent context.Context, cfg SharedMeshConfig) (r *sharedMesh,
 			store.Close()
 		}
 	}()
-	key, err := localTestPeerKey(store)
+	key, authority, addrs, err := sharedMeshEnrollment(parent, cfg, store)
 	if err != nil {
 		return nil, err
-	}
-	id, err := peer.IDFromPrivateKey(key)
-	if err != nil {
-		return nil, err
-	}
-	pub, err := crypto.MarshalPublicKey(key.GetPublic())
-	if err != nil {
-		return nil, err
-	}
-	stamp := time.Now().UnixMilli()
-	signature, err := key.Sign(api.EnrollChallenge(id.String(), stamp))
-	if err != nil {
-		return nil, err
-	}
-	enrollment, _ := proto.Marshal(&api.BootstrapEnrollRequest{BootstrapToken: cfg.JoinToken, PeerId: id.String(), PublicKey: pub, RequestedRole: api.RoleNode, Timestamp: stamp, ChallengeSignature: signature})
-	req, err := http.NewRequestWithContext(parent, "POST", cfg.BootstrapURL+"/enroll", bytes.NewReader(enrollment))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-protobuf")
-	client := &http.Client{Timeout: sharedMeshTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	response, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("enrollment request failed: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("enrollment rejected: HTTP %d", response.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024))
-	if err != nil {
-		return nil, err
-	}
-	enrolled := new(api.BootstrapEnrollResponse)
-	if err = proto.Unmarshal(data, enrolled); err != nil {
-		return nil, err
-	}
-	if enrolled.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
-		return nil, errors.New("bootstrap enrollment was not approved")
-	}
-	if len(enrolled.ControlPlanePublicKey) != ed25519.PublicKeySize || len(enrolled.RouterAddresses) == 0 {
-		return nil, errors.New("invalid enrollment response")
-	}
-	authority := ed25519.PublicKey(enrolled.ControlPlanePublicKey)
-	if _, err = identity.VerifyBiscuit(enrolled.BiscuitToken, id, []ed25519.PublicKey{authority}, identity.DefaultAuthorizerTimeout); err != nil {
-		return nil, err
-	}
-	if err = identity.VerifyBiscuitRole(enrolled.BiscuitToken, authority, api.RoleNode, identity.DefaultAuthorizerTimeout); err != nil {
-		return nil, err
-	}
-	if err = store.SaveIdentity(enrolled.BiscuitToken); err != nil {
-		return nil, err
-	}
-	if err = store.SaveIdentityExpiration(enrolled.Expiration); err != nil {
-		return nil, err
-	}
-	if err = store.SaveMeshConfig(authority, enrolled.RouterAddresses); err != nil {
-		return nil, err
-	}
-	if err = store.SaveTrustedKeys(nil); err != nil {
-		return nil, err
-	}
-	if err = store.SaveControlPlaneURL(cfg.BootstrapURL); err != nil {
-		return nil, err
-	}
-	var addrs []multiaddr.Multiaddr
-	for _, raw := range enrolled.RouterAddresses {
-		a, e := multiaddr.NewMultiaddr(raw)
-		if e != nil {
-			return nil, e
-		}
-		addrs = append(addrs, a)
 	}
 	announce := false
 	instance, err := node.NewSamNode(node.Options{Store: store, PrivKey: key, ControlPlanePubKey: authority, RouterAddrs: addrs, AllowLoopback: true, AnnouncePrivateAddrs: &announce, RequiredRole: api.RoleNode, RequirePeerIdentity: true, RouterRelayOnly: true, ListenAddrs: []string{"/ip4/0.0.0.0/tcp/0"}, DiscoveryInterval: "1s", AutoRelayMinInterval: time.Second, AutoRelayBootDelay: time.Millisecond, AutoRelayBackoff: time.Second})
@@ -175,7 +105,7 @@ func newSharedMesh(parent context.Context, cfg SharedMeshConfig) (r *sharedMesh,
 			instance.Teardown()
 		}
 	}()
-	if err = instance.Start(ctx); err != nil {
+	if err = instance.StartSharedMesh(ctx); err != nil {
 		return nil, err
 	}
 	// Explicitly establish authenticated router connectivity before publication.
@@ -206,6 +136,144 @@ func newSharedMesh(parent context.Context, cfg SharedMeshConfig) (r *sharedMesh,
 	}
 	return r, nil
 }
+
+// A key alone can remain after a rejected first enrollment. Any membership
+// state, however, must be complete: never spend a join token to repair it.
+func sharedMeshEnrollment(ctx context.Context, cfg SharedMeshConfig, store *node.Store) (crypto.PrivKey, ed25519.PublicKey, []multiaddr.Multiaddr, error) {
+	token, _ := store.LoadIdentity()
+	authority, routers, err := store.LoadMeshConfig()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid stored mesh config: %w", err)
+	}
+	storedURL, err := store.LoadControlPlaneURL()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	keys, err := store.LoadTrustedKeys()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("invalid stored trusted keys: %w", err)
+	}
+	for _, key := range keys {
+		if len(key.Key) != ed25519.PublicKeySize {
+			return nil, nil, nil, errors.New("invalid stored trusted key")
+		}
+	}
+	expiration, expirationErr := store.LoadIdentityExpiration()
+	existing := len(token) > 0 || len(authority) > 0 || len(routers) > 0 || storedURL != "" || len(keys) > 0 || expirationErr == nil
+	if existing {
+		if len(token) == 0 || len(authority) != ed25519.PublicKeySize || len(routers) == 0 || storedURL == "" || expirationErr != nil || expiration <= 0 {
+			return nil, nil, nil, errors.New("stored mesh enrollment is incomplete; explicitly reset mesh membership before rejoining")
+		}
+		if strings.TrimRight(storedURL, "/") != cfg.BootstrapURL {
+			return nil, nil, nil, errors.New("bootstrapUrl does not match stored mesh enrollment; explicitly reset mesh membership before switching meshes")
+		}
+		encoded, err := store.LoadKey()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if len(encoded) == 0 {
+			return nil, nil, nil, errors.New("stored mesh enrollment is missing its private key")
+		}
+	} else if cfg.JoinToken == "" {
+		return nil, nil, nil, errors.New("joinToken is required for first mesh enrollment")
+	}
+	key, err := localTestPeerKey(store)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !existing {
+		if err := bootstrapSharedMesh(ctx, cfg, store, key); err != nil {
+			return nil, nil, nil, err
+		}
+		authority, routers, err = store.LoadMeshConfig()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	var addrs []multiaddr.Multiaddr
+	for _, raw := range routers {
+		addr, err := multiaddr.NewMultiaddr(raw)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("invalid stored router address: %w", err)
+		}
+		addrs = append(addrs, addr)
+	}
+	return key, authority, addrs, nil
+}
+
+func bootstrapSharedMesh(parent context.Context, cfg SharedMeshConfig, store *node.Store, key crypto.PrivKey) error {
+	id, err := peer.IDFromPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	pub, err := crypto.MarshalPublicKey(key.GetPublic())
+	if err != nil {
+		return err
+	}
+	stamp := time.Now().UnixMilli()
+	signature, err := key.Sign(api.EnrollChallenge(id.String(), stamp))
+	if err != nil {
+		return err
+	}
+	enrollment, _ := proto.Marshal(&api.BootstrapEnrollRequest{BootstrapToken: cfg.JoinToken, PeerId: id.String(), PublicKey: pub, RequestedRole: api.RoleNode, Timestamp: stamp, ChallengeSignature: signature})
+	req, err := http.NewRequestWithContext(parent, "POST", cfg.BootstrapURL+"/enroll", bytes.NewReader(enrollment))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	client := &http.Client{Timeout: sharedMeshTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("enrollment request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("enrollment rejected: HTTP %d", response.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1024*1024))
+	if err != nil {
+		return err
+	}
+	enrolled := new(api.BootstrapEnrollResponse)
+	if err = proto.Unmarshal(data, enrolled); err != nil {
+		return err
+	}
+	if enrolled.Status != api.EnrollmentStatus_ENROLLMENT_STATUS_APPROVED {
+		return errors.New("bootstrap enrollment was not approved")
+	}
+	if len(enrolled.ControlPlanePublicKey) != ed25519.PublicKeySize || len(enrolled.RouterAddresses) == 0 || enrolled.Expiration <= time.Now().Unix() {
+		return errors.New("invalid enrollment response")
+	}
+	for _, raw := range enrolled.RouterAddresses {
+		if _, err := multiaddr.NewMultiaddr(raw); err != nil {
+			return fmt.Errorf("invalid enrollment router address: %w", err)
+		}
+	}
+	authority := ed25519.PublicKey(enrolled.ControlPlanePublicKey)
+	if _, err = identity.VerifyBiscuit(enrolled.BiscuitToken, id, []ed25519.PublicKey{authority}, identity.DefaultAuthorizerTimeout); err != nil {
+		return err
+	}
+	if err = identity.VerifyBiscuitRole(enrolled.BiscuitToken, authority, api.RoleNode, identity.DefaultAuthorizerTimeout); err != nil {
+		return err
+	}
+	if err = store.SaveIdentity(enrolled.BiscuitToken); err != nil {
+		return err
+	}
+	if err = store.SaveIdentityExpiration(enrolled.Expiration); err != nil {
+		return err
+	}
+	if err = store.SaveMeshConfig(authority, enrolled.RouterAddresses); err != nil {
+		return err
+	}
+	if err = store.SaveTrustedKeys(nil); err != nil {
+		return err
+	}
+	if err = store.SaveControlPlaneURL(cfg.BootstrapURL); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (r *sharedMesh) close() error {
 	r.once.Do(func() { r.cancel(); r.closeErr = errors.Join(r.node.Teardown(), r.store.Close()) })
 	return r.closeErr
