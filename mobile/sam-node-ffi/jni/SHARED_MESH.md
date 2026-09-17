@@ -33,6 +33,13 @@ supplies `backendUrl` such as `http://127.0.0.1:43123/mcp` and `backendToken`.
 `discover`, and `call` return UTF-8 JSON; an `error` member denotes failure.
 Each returned C string must be freed with `FreeString` (the JNI shim does this).
 
+The `error` member is currently a prose string; clients that classify failures
+(for example, mapping a destination auth rejection to a standardized tool
+error) can only match message prefixes such as `auth rejected`. TODO: add a
+structured `errorCode` member with a closed vocabulary (`AUTH_REJECTED`,
+`NO_ROUTE`, `TIMEOUT`, ...) alongside the message so classification rides the
+field, not the wording, and the vocabulary is asserted by SAM's own tests.
+
 The backend must speak MCP Streamable HTTP. Native probes, lists and calls send
 `Authorization: Bearer <backendToken>` and `X-Peer-Id`. For a remote call the
 peer header is the authenticated libp2p caller; probes use the publisher's own
