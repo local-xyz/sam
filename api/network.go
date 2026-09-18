@@ -227,6 +227,9 @@ const (
 
 	// ServiceTypeStringA2A is the string identifier for A2A (Agent2Agent) services.
 	ServiceTypeStringA2A = "a2a"
+
+	// ServiceTypeStringHTTP identifies opaque HTTP services without a protocol adapter.
+	ServiceTypeStringHTTP = "http"
 )
 
 // ParseServiceType converts a string identifier (e.g. from JSON or REST) to the ServiceType protobuf enum.
@@ -238,6 +241,8 @@ func ParseServiceType(s string) (ServiceType, error) {
 		return ServiceType_SERVICE_TYPE_INFERENCE, nil
 	case ServiceTypeStringA2A:
 		return ServiceType_SERVICE_TYPE_A2A, nil
+	case ServiceTypeStringHTTP:
+		return ServiceType_SERVICE_TYPE_HTTP, nil
 	default:
 		return ServiceType_SERVICE_TYPE_UNSPECIFIED, fmt.Errorf("invalid service type: %s", s)
 	}
@@ -252,6 +257,8 @@ func ServiceTypeToString(t ServiceType) (string, error) {
 		return ServiceTypeStringInference, nil
 	case ServiceType_SERVICE_TYPE_A2A:
 		return ServiceTypeStringA2A, nil
+	case ServiceType_SERVICE_TYPE_HTTP:
+		return ServiceTypeStringHTTP, nil
 	default:
 		return "", fmt.Errorf("invalid or unspecified service type")
 	}

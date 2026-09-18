@@ -126,6 +126,8 @@ enum ServiceType {
   SERVICE_TYPE_MCP = 1;
   SERVICE_TYPE_INFERENCE = 2;
   SERVICE_TYPE_A2A = 3;
+  // Opaque HTTP endpoints; application protocols and authorization remain at the backend.
+  SERVICE_TYPE_HTTP = 4;
 }
 
 message ServiceInfo {

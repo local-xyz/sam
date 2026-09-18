@@ -130,6 +130,13 @@ func NewServiceFromRequest(req *api.RegisterServiceRequest) (Service, error) {
 		return &InferenceService{baseService: baseService{info: info, backend: req.Backend}}, nil
 	case api.ServiceType_SERVICE_TYPE_A2A:
 		return &A2AService{baseService: baseService{info: info, backend: req.Backend}}, nil
+	case api.ServiceType_SERVICE_TYPE_HTTP:
+		// HTTP has no protocol-specific probe or transformation. In particular,
+		// command backends speak MCP stdio and cannot represent an HTTP service.
+		if _, ok := req.Backend.(*api.RegisterServiceRequest_TargetUrl); !ok {
+			return nil, fmt.Errorf("HTTP services require a URL backend")
+		}
+		return &baseService{info: info, backend: req.Backend}, nil
 	default:
 		return nil, fmt.Errorf("unspecified or unsupported service type: %v", info.Type)
 	}

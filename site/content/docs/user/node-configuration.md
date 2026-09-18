@@ -66,12 +66,12 @@ The `services` array allows you to register endpoints that remote peers in the S
 
 | Property | Description |
 | :--- | :--- |
-| `type` | The protocol protocol type. Supported values are `mcp` (Model Context Protocol), `inference`, or `a2a`. |
+| `type` | The service type: `mcp` (Model Context Protocol), `inference`, `a2a`, or `http` (opaque HTTP). |
 | `name` | The unique name of the service (e.g., `git-helper`). This must exactly match the name authorized by the control plane's mesh policy (e.g., `mcp://git-helper`). |
 | `description` | A human-readable description published to the mesh discovery catalogue. |
 | `command` | *(For MCP)* The executable command array to spawn as a local subprocess, speaking MCP over stdio (e.g. `["node", "index.js"]`). Mutually exclusive with `target_url`. |
 | `env` | *(For MCP)* Key-value environment variables passed to the subprocess. |
-| `target_url` | *(For MCP/Inference/A2A)* The upstream URL to proxy traffic to. For `type: mcp`, this points to an already-running Streamable HTTP MCP server; SAM does not spawn or manage its lifecycle, but only proxies to it. Mutually exclusive with `command`. Must not carry a credential (`http://user:pass@...` is refused); use `target_auth_path`. |
+| `target_url` | *(For MCP/Inference/A2A/HTTP)* The upstream URL to proxy traffic to. For `type: mcp`, this points to an already-running Streamable HTTP MCP server; SAM does not spawn or manage its lifecycle, but only proxies to it. Mutually exclusive with `command`. Must not carry a credential (`http://user:pass@...` is refused); use `target_auth_path`. |
 | `target_auth_path` | *(Optional, with `target_url`)* Path to a file holding the credential the backend requires: a bare `TOKEN` is sent as `Authorization: Bearer TOKEN`, `user:pass` as HTTP Basic. The node reads the file once at start, presents the credential on every request to the backend (overriding any `Authorization` a caller sent) and never advertises or logs it. A file, not a value, because `sam-node.yaml` is copied, committed and rendered into ConfigMaps; mount a Secret and point here, as with `--api-token-path`. |
 
 ### Inference Service Path Standards & Proxy Routing
@@ -80,6 +80,34 @@ When configuring `target_url` for `type: inference` services (e.g. Ollama, vLLM,
 * **Root Target URL Standard**: Always register `target_url` using the base root URL (e.g. `http://localhost:11434` or `http://localhost:8000`), strictly omitting `/v1`.
 * **OpenAI Facade Access**: Clients connecting via the node's local OpenAI Facade (`http://localhost:8080/v1`) request paths like `/v1/chat/completions`. SAM automatically proxies these to the backend's root URL.
 * **Raw Proxy Access**: If bypassing the Facade and making requests directly via the local egress proxy (`/sam/{peer}/inference/{service}`), the request path must include the explicit `/v1` namespace suffix (e.g. `http://localhost:8080/sam/{peer}/inference/{service}/v1/chat/completions`).
+
+### HTTP Service Routing
+
+Use `type: http` for an existing HTTP application that owns its own protocol:
+
+```yaml
+services:
+  - type: http
+    name: roomlink
+    target_url: http://127.0.0.1:8642
+```
+
+Peers discover it with `/sam/service/discover?type=http&name=roomlink` and call
+`/sam/{peer}/http/roomlink/...` through their local node. Control-plane service
+grants use `http://roomlink`. All participating nodes need HTTP service support.
+
+The existing mesh proxy carries methods, paths, queries, request bodies, response
+statuses, and streaming HTTP responses (including SSE). SAM applies its normal
+peer authentication and local attenuation; it does not interpret events or add
+application retries, persistence, or an A2A agent card. Only URL backends are
+supported. No protocol-specific health probe runs: discovery announces the
+configured service, not proof that its backend is ready.
+
+Authenticate to the local sidecar using `X-Sam-Authentication: Bearer <token>`.
+SAM strips that header before forwarding and preserves the application's
+`Authorization` header. Leave `target_auth_path` unset when the backend needs
+caller-specific credentials such as a Hermes room grant; configuring it overrides
+the caller's `Authorization` on every request.
 
 ### A2A Service Routing
 

@@ -31,7 +31,7 @@ import (
 
 // ListLocalServicesParams defines the parameters for the list_local_services tool.
 type ListLocalServicesParams struct {
-	Type string `json:"type,omitempty" jsonschema:"Optional service type filter (mcp, inference, a2a). Empty means all types."`
+	Type string `json:"type,omitempty" jsonschema:"Optional service type filter (mcp, inference, a2a, http). Empty means all types."`
 }
 
 // handleListLocalServices implements the list_local_services tool.
@@ -66,7 +66,7 @@ const inferenceInvocationHint = `To call an inference service, send a normal HTT
 
 // DiscoverRemoteServicesParams defines the parameters for the discover_remote_services tool.
 type DiscoverRemoteServicesParams struct {
-	Type   string `json:"type" jsonschema:"Required. One of: mcp, inference, a2a."`
+	Type   string `json:"type" jsonschema:"Required. One of: mcp, inference, a2a, http."`
 	Name   string `json:"name,omitempty" jsonschema:"Optional service name. Omit to list all services of the given type."`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Optional limit for pagination. Defaults to 20."`
 	Offset int    `json:"offset,omitempty" jsonschema:"Optional offset for pagination. Defaults to 0."`
