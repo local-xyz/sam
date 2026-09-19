@@ -109,9 +109,9 @@ brings up the whole pool with one command.
 
 ### 1. Set an LLM key for the reviewer image
 
-The reviewer workers call an LLM, so set your API key on the API-key `ENV`
-line in `development/examples/code-reviewer-pool/reviewer/Dockerfile` before
-building. A free key is enough for the demo.
+The reviewer workers call an LLM. Supply `GEMINI_API_KEY` at runtime through
+`service.env`, preferably using a Kubernetes Secret. Do not put the key in
+the Dockerfile or image.
 
 ### 2. Bring the mesh up and deploy the pool
 
@@ -125,8 +125,8 @@ three reviewer replicas and one manager. Each replica enrolls as its own
 mesh node, so the pool is three `code-reviewer` services with the same name.
 
 ```bash
-docker build -t reviewer:local development/examples/code-reviewer-pool/reviewer
-docker build -t pool-manager:local development/examples/code-reviewer-pool/manager
+docker build -t reviewer:local -f development/examples/code-reviewer-pool/reviewer/Dockerfile development/examples/code-reviewer-pool
+docker build -t pool-manager:local -f development/examples/code-reviewer-pool/manager/Dockerfile development/examples/code-reviewer-pool
 kind load docker-image --name sam-kind reviewer:local pool-manager:local
 
 helm --kube-context kind-sam-kind -n sam-kind install reviewers charts/sam-node \
@@ -221,3 +221,15 @@ kubectl --context kind-sam-kind -n sam-kind scale deploy/reviewers-sam-node --re
 | `SAM_LEASE_MS` | `60000` | manager |
 | `SAM_GRACE_MISSES` | `2` | manager |
 | `SAM_POOL_SECRET` | `sam-dev-pool-secret` (enforcement always on) | manager + reviewer |
+
+## Optional shared review workspace
+
+The example can also share review reports through Hypercore, Autobase and
+Hyperdrive, with Hyperswarm providing the separate replication network.
+The pool retains one manager and its existing acquire/review/release flow.
+Sharing is disabled unless `SAM_WORKSPACE_DIR` is set.
+
+See the [example workspace README](https://github.com/local-xyz/sam/tree/feat/reviewer-shared-workspace/development/examples/code-reviewer-pool#readme)
+for the local demo, explicit writer admission and persistent storage setup.
+Workspace tools are exposed to the calling harness; the Gemini subprocess
+receives prior findings through its wrapper, not through newly configured MCP tools.
