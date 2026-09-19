@@ -1,6 +1,6 @@
 # Shared Workspace for SAM’s Reviewer Pool — Implementation Plan
 
-> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans when implementation is requested. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans when implementation is requested. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Let reviewers in SAM’s existing code-reviewer pool publish findings and read one another’s previous work through a replicated shared workspace.
 
@@ -119,20 +119,20 @@ Autobase’s deterministic `apply` appends validated records to its managed view
 
 ### Task 1: Add the workspace module
 
-- [ ] Write a failing test with two isolated Corestores: A publishes a report; after replication, B lists it and retrieves the same bytes.
-- [ ] Implement the interface above with Autobase, one Hyperdrive per reviewer and Hyperswarm connections. Use in-memory replication streams for deterministic tests.
-- [ ] Test disconnect → local publication → reconnect → eventual retrieval. Also test a known record with an unavailable artifact and a mismatched content hash.
-- [ ] Commit the module and tests on the feature branch.
+- [x] Write a failing test with two isolated Corestores: A publishes a report; after replication, B lists it and retrieves the same bytes.
+- [x] Implement the interface above with Autobase, one Hyperdrive per reviewer and Hyperswarm connections. Use in-memory replication streams for deterministic tests.
+- [x] Test disconnect → local publication → reconnect → eventual retrieval. Also test a known record with an unavailable artifact and a mismatched content hash.
+- [x] Commit the module and tests on the feature branch.
 
 ### Task 2: Attach it to the existing reviewer flow
 
-- [ ] Add a failing manager-discovery test containing `review_code` and a workspace read tool; assert only `review_code` is selected.
-- [ ] Apply the exact-name filter and open the founder/reviewer workspace instances at startup.
-- [ ] Add `list_findings` and `read_finding` MCP tools to the reviewer service, delegating directly to the workspace interface.
-- [ ] Extend `runGemini(code)` to `runGemini(code, priorFindings)`. Retrieve up to three available reports for the same code hash, cap combined context at 16 KiB, and label them as attributed, untrusted review material.
-- [ ] After `runGemini` returns, publish its report. If workspace reading or publishing fails, return the normal review with a sharing-status note. Do not rerun the review to repair replication.
-- [ ] Test using an injected fake reviewer: B receives A’s prior finding as context; unavailable workspace data does not prevent a review result.
-- [ ] Commit the reviewer integration.
+- [x] Add a failing manager-discovery test containing `review_code` and a workspace read tool; assert only `review_code` is selected.
+- [x] Apply the exact-name filter and open the founder/reviewer workspace instances at startup.
+- [x] Add `list_findings` and `read_finding` MCP tools to the reviewer service, delegating directly to the workspace interface.
+- [x] Extend `runGemini(code)` to `runGemini(code, priorFindings)`. Retrieve up to three available reports for the same code hash, cap combined context at 16 KiB, and label them as attributed, untrusted review material.
+- [x] After `runGemini` returns, publish its report. If workspace reading or publishing fails, return the normal review with a sharing-status note. Do not rerun the review to repair replication.
+- [x] Test using an injected fake reviewer: B receives A’s prior finding as context; unavailable workspace data does not prevent a review result.
+- [x] Commit the reviewer integration.
 
 The change attaches around [the existing `runGemini` call](https://github.com/google/sam/blob/adb56e2bfb8fc6b42dd7377a0a6e36375b403e6d/development/examples/code-reviewer-pool/reviewer/review_server.mjs#L64):
 
@@ -142,11 +142,11 @@ read available prior findings → existing review → publish report → return 
 
 ### Task 3: Package and demonstrate the basics
 
-- [ ] Provide an executable local replication demo with the same workspace/review modules and a fake reviewer; document how to enable it in the existing SAM deployment.
-- [ ] Support file-based local API-token configuration; document the existing chart-generated token requirement.
-- [ ] Run the local demo: review on A, retrieve on B, and demonstrate B receives A’s attributed report as context.
-- [ ] Verify reopen and disconnected publication/reconnection in integration tests. Run repository checks and record unavailable infrastructure honestly.
-- [ ] Record the observed behavior and the few reproduction commands in the example README. No quality or recovery claims beyond the checks actually run.
+- [x] Provide an executable local replication demo with the same workspace/review modules and a fake reviewer; document how to enable it in the existing SAM deployment.
+- [x] Support file-based local API-token configuration; document the existing chart-generated token requirement.
+- [x] Run the local demo: review on A, retrieve on B, and demonstrate B receives A’s attributed report as context.
+- [x] Verify reopen and disconnected publication/reconnection in integration tests. Run repository checks and record unavailable infrastructure honestly.
+- [x] Record the observed behavior and the few reproduction commands in the example README. No quality or recovery claims beyond the checks actually run.
 
 ## What happened to the allocation concern?
 
@@ -157,3 +157,23 @@ The earlier proposal combined these independent questions and introduced unneces
 ## Implementation scope
 
 Workspace sharing is opt-in through `SAM_WORKSPACE_DIR`; without it the example retains its existing review behavior. `shared/` has its own pinned npm package and lockfile. A small operator CLI initializes/inspects a stopped workspace; startup logs public keys for running services. The first implementation verifies real storage/replication locally, without requiring an LLM key or a running Kubernetes cluster. Live SAM deployment remains documented and is only claimed tested if actually run.
+
+## Verification record
+
+Implemented on `feat/reviewer-shared-workspace` in the SAM fork. The example's
+14 Node tests and local replication/context-sharing demo pass; an independent
+branch review found no defects in the controlled-demo scope. The full Linux
+cross-build passes. Public Hyperswarm discovery, live SAM deployment and Gemini
+execution have not been exercised.
+
+Repository-wide checks are not all green on this macOS host: native `make` and
+`make e2e-test` stop at Linux-only `nano-init` symbols; `make lint` passes chart
+checks but its linter requires the unavailable Docker daemon. `make test` found
+four socket-path-length failures (all pass on targeted rerun with `TMPDIR=/tmp`)
+and `TestSamNodeJoinOfflineAccessSavesRefreshToken` failed to find its refresh
+token on both the full run and a targeted retry. No Go source or module dependencies were changed.
+
+The socket-path cases were `TestIdentityEvidenceTrailingSlashReturnsNotFound`,
+`TestMetricsGatedOnTCPButNotOnTheSocket`, `TestSidecarSocketAuthorizesWithoutToken`,
+and `TestListenLocalSocket` (its stale/live socket subtests). All passed with the
+shorter temporary directory; the full `make test` command is still reported as failed.
