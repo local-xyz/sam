@@ -1,0 +1,16 @@
+{
+  "name": "sam-review-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs ../reviewer/*.test.mjs ../manager/*.test.mjs",
+    "demo": "node demo.mjs"
+  },
+  "dependencies": {
+    "autobase": "7.28.2",
+    "corestore": "7.12.5",
+    "hyperdrive": "13.3.4",
+    "hyperswarm": "4.17.1"
+  }
+}
