@@ -1,0 +1,15 @@
+{
+  "name": "knowledge-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^4.19.0",
+    "zod": "^3.23.0"
+  },
+  "scripts": {
+    "start": "node agent_server.mjs",
+    "test": "node --test *.test.mjs"
+  }
+}
