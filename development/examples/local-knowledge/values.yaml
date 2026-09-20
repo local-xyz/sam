@@ -1,0 +1,26 @@
+# Helm release name: knowledge-agent
+config:
+  version: v1alpha1
+  attenuation:
+    policies: []
+  services:
+    - type: mcp
+      name: knowledge-agent
+      description: An agent that answers from local knowledge and can consult peers
+      target_url: http://127.0.0.1:7779/mcp
+service:
+  name: knowledge-agent
+  image: knowledge-agent:local
+  env:
+    - name: GEMINI_API_KEY
+      valueFrom:
+        secretKeyRef:
+          name: knowledge-agent-gemini
+          key: api-key
+    - name: SAM_NODE_URL
+      value: http://127.0.0.1:8080/mcp
+    - name: SAM_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: knowledge-agent-sam-node-api-token
+          key: api-token

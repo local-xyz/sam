@@ -7,6 +7,10 @@ config:
       name: code-reviewer
       description: Reviews code snippets via a Gemini-backed agent
       target_url: http://127.0.0.1:7779/mcp
+    - type: a2a
+      name: code-reviewer
+      description: Streams Gemini code review events over A2A
+      target_url: http://127.0.0.1:7779/a2a
 service:
   name: reviewer
   image: reviewer:local

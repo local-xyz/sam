@@ -68,7 +68,7 @@ teardown() {
   local mesh_base="http://${MESH_PREFIX}-node-1:8080/sam/${node2_peer_id}/a2a/echo"
 
   # Stock python client: resolves the card through the mesh (client.py asserts
-  # the regenerated URLs, the gRPC drop and streaming-off) and gets an echo.
+  # the regenerated URLs, the gRPC drop and streaming preservation) and gets an echo.
   echo "[$(date +%T)] Running stock a2a-sdk client against ${mesh_base}"
   run docker run --rm --network "${MESH_NETWORK}" \
     -e SAM_API_TOKEN="secret-token" \

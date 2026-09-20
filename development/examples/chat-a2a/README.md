@@ -48,7 +48,7 @@ curl -s -H 'X-Sam-Authentication: Bearer devtoken' \
 ```
 
 The interface URLs point back at this mesh path (not the agent's own address)
-and `capabilities.streaming` is forced to `false` — that rewrite is what lets
+and `capabilities.streaming` is preserved from the agent — that rewrite is what lets
 a stock A2A client work against the mesh unmodified.
 
 ## 6. Chat

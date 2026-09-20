@@ -1,11 +1,16 @@
 import express from "express";
+import { createInterface } from "node:readline";
+import { randomUUID } from "node:crypto";
+import { AgentCard, Message, Task, TaskStatusUpdateEvent } from "@a2a-js/sdk";
+import { AgentEvent, DefaultRequestHandler, InMemoryTaskStore } from "@a2a-js/sdk/server";
+import { agentCardHandler, jsonRpcHandler, UserBuilder } from "@a2a-js/sdk/server/express";
 import { spawn } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { verifyToken } from "./lease-token.mjs";
 
-const PORT = 7779;
+const PORT = Number(process.env.PORT ?? 7779);
 const REVIEW_PROMPT =
   "You are a senior code reviewer. Review the code provided on stdin. " +
   "Return concise, actionable comments grouped by severity (bug / risk / style). " +
@@ -18,22 +23,35 @@ const POOL_SECRET = process.env.SAM_POOL_SECRET ?? "sam-dev-pool-secret"; // sha
 const NO_LEASE = "NO_LEASE";
 let busy = false;
 
-// Run `gemini -p <prompt>` with the snippet piped on stdin; resolve its stdout.
-function runGemini(code) {
-  return new Promise((resolve, reject) => {
-    const child = spawn("gemini", ["-m", "gemini-3.1-flash-lite","-p", REVIEW_PROMPT]);
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    child.on("error", reject);
-    child.on("close", (exitCode) => {
-      if (exitCode === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || `gemini exited with code ${exitCode}`));
-    });
-    child.stdin.write(code);
-    child.stdin.end();
-  });
+// MCP keeps its plain-text result; A2A consumes Gemini's JSONL events live.
+async function runGemini(code, onEvent, signal) {
+  const args = ["-m", process.env.GEMINI_MODEL ?? "gemini-3.1-flash-lite", "-p", REVIEW_PROMPT];
+  if (onEvent) args.push("--output-format", "stream-json");
+  const child = spawn("gemini", args, { signal });
+  let output = "", stderr = "", failure;
+  child.stderr.on("data", data => { stderr += data; });
+  child.on("error", error => { failure = error; });
+  child.stdin.on("error", error => { failure ??= error; });
+  const closed = new Promise(resolve => child.once("close", resolve));
+  child.stdin.end(code);
+  try {
+    for await (const line of createInterface({ input: child.stdout })) {
+      if (!onEvent) { output += line + "\n"; continue; }
+      if (!line.trim()) continue;
+      const event = JSON.parse(line);
+      onEvent(event);
+      if (event.type === "message" && event.role === "assistant") output += event.content ?? "";
+      if (event.type === "error" && event.severity === "error") failure = new Error(event.message);
+      if (event.type === "result" && event.status === "error") failure ??= new Error("Gemini review failed");
+    }
+    const exit = await closed;
+    if (failure) throw failure;
+    if (exit !== 0) throw new Error(stderr.trim() || `gemini exited with code ${exit}`);
+    return output.trim();
+  } finally {
+    child.kill();
+    await closed;
+  }
 }
 
 // A fresh McpServer per request: the SDK forbids connecting one server to more
@@ -89,6 +107,46 @@ app.post("/mcp", async (req, res) => {
     }
   }
 });
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`code-reviewer MCP server on :${PORT}/mcp`);
+// Both protocols share the same lease enforcement and single-flight worker.
+let active;
+const card = AgentCard.fromJSON({
+  name: "code-reviewer", description: "Code review with live Gemini events", version: "1.0.0",
+  capabilities: { streaming: true }, defaultInputModes: ["text/plain"], defaultOutputModes: ["text/plain", "application/json"],
+  skills: [{ id: "review_code", name: "Review code", description: REVIEW_PROMPT, tags: ["code-review"] }],
+  supportedInterfaces: [{ url: `http://127.0.0.1:${PORT}/a2a`, protocolBinding: "JSONRPC", protocolVersion: "1.0" }],
+});
+const executor = {
+  async execute(context, bus) {
+    const { taskId, contextId } = context;
+    const message = text => Message.fromJSON({ messageId: randomUUID(), role: "ROLE_AGENT", taskId, contextId, parts: [{ text }] });
+    const status = (state, text, metadata) => bus.publish(AgentEvent.statusUpdate(TaskStatusUpdateEvent.fromJSON({
+      taskId, contextId, status: { state, message: Message.toJSON(message(text)) }, metadata,
+    })));
+    bus.publish(AgentEvent.task(Task.fromJSON({ id: taskId, contextId, status: { state: "TASK_STATE_SUBMITTED" } })));
+    if (!verifyToken(POOL_SECRET, context.request.metadata?.token, Date.now()).valid) {
+      status("TASK_STATE_FAILED", NO_LEASE); return;
+    }
+    if (busy) { status("TASK_STATE_FAILED", POOL_BUSY); return; }
+    busy = true;
+    const controller = new AbortController();
+    active = { taskId, controller };
+    try {
+      const code = context.userMessage.parts.filter(p => p.content?.$case === "text").map(p => p.content.value).join("\n");
+      const review = await runGemini(code, event => {
+        console.log(JSON.stringify({ taskId, gemini: event }));
+        status("TASK_STATE_WORKING", event.type, { gemini: event });
+      }, controller.signal);
+      status("TASK_STATE_COMPLETED", review);
+    } catch (error) {
+      status(controller.signal.aborted ? "TASK_STATE_CANCELED" : "TASK_STATE_FAILED", error.message);
+    } finally { busy = false; active = undefined; }
+  },
+  async cancelTask(taskId) { if (active?.taskId === taskId) active.controller.abort(); },
+};
+const a2a = new DefaultRequestHandler(card, new InMemoryTaskStore(), executor);
+app.use("/a2a/.well-known/agent-card.json", agentCardHandler({ agentCardProvider: a2a }));
+app.use("/a2a", jsonRpcHandler({ requestHandler: a2a, userBuilder: UserBuilder.noAuthentication }));
+const listener = app.listen(PORT, "0.0.0.0", () => {
+  card.supportedInterfaces[0].url = `http://127.0.0.1:${listener.address().port}/a2a`;
+  console.log(`code-reviewer on :${listener.address().port} (MCP /mcp, A2A /a2a)`);
 });

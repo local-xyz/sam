@@ -199,7 +199,7 @@ func fetchRemoteAgentCard(node *SamNode, rt http.RoundTripper, r *http.Request, 
 
 // regenerateAgentCardForMesh rebuilds a fetched agent card for mesh use:
 // interface URLs point back at the mesh path, bindings the mesh cannot carry
-// (gRPC) are dropped, streaming is advertised off until verified, and the
+// (gRPC) are dropped, streaming capability is preserved, and the
 // original signatures are removed since they no longer match the content.
 func regenerateAgentCardForMesh(card *a2a.AgentCard, base string) error {
 	kept := make([]*a2a.AgentInterface, 0, len(card.SupportedInterfaces))
@@ -214,7 +214,6 @@ func regenerateAgentCardForMesh(card *a2a.AgentCard, base string) error {
 		return fmt.Errorf("agent card advertises no supported interface the mesh can carry (JSONRPC or HTTP+JSON); is the agent serving a pre-1.0 A2A card?")
 	}
 	card.SupportedInterfaces = kept
-	card.Capabilities.Streaming = false
 	card.Signatures = nil
 	// Required list fields must stay arrays: encoding/json marshals nil
 	// slices as null, which strict SDK card parsers (pydantic) reject.

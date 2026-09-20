@@ -69,14 +69,27 @@ func TestA2ACUJ(t *testing.T) {
 
 	// Stock-SDK A2A agent on node A's side: a2asrv serving its card and
 	// echoing message/send. The card deliberately advertises a gRPC
-	// interface, streaming, and a stale signature: the mesh must drop all
-	// three on regeneration. The backend exists before the node: services
+	// interface and a stale signature (dropped), plus streaming (preserved). The backend exists before the node: services
 	// are declared in the node's configuration, never registered at runtime.
+	releaseStream := make(chan struct{}, 1)
 	var sendCount atomic.Int32
 	var sawLabelsHeader atomic.Bool
 	echo := a2asrv.AgentExecutorFunc(func(ctx context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 		return func(yield func(a2a.Event, error) bool) {
 			sendCount.Add(1)
+			if ec.Message.Parts[0].Text() == "stream" {
+				if !yield(a2a.NewSubmittedTask(ec, ec.Message), nil) {
+					return
+				}
+				select {
+				case <-releaseStream:
+				case <-ctx.Done():
+					return
+				}
+				yield(a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted,
+					a2a.NewMessageForTask(a2a.MessageRoleAgent, ec, a2a.NewTextPart("stream finished"))), nil)
+				return
+			}
 			yield(a2a.NewMessageForTask(a2a.MessageRoleAgent, ec, a2a.NewTextPart("echo from eu")), nil)
 		}
 	})
@@ -101,6 +114,7 @@ func TestA2ACUJ(t *testing.T) {
 		mux.ServeHTTP(w, r)
 	}))
 	defer agent.Close()
+	defer close(releaseStream)
 
 	t.Log("Starting Node A (provider, region=eu)...")
 	_ = startBackgroundNode(t, nodeBin, hubAddr, homeA,
@@ -157,8 +171,8 @@ func TestA2ACUJ(t *testing.T) {
 	if card.SupportedInterfaces[0].ProtocolBinding != a2a.TransportProtocolJSONRPC {
 		t.Errorf("binding = %q, want JSONRPC", card.SupportedInterfaces[0].ProtocolBinding)
 	}
-	if card.Capabilities.Streaming {
-		t.Error("streaming must be advertised off through the mesh")
+	if !card.Capabilities.Streaming {
+		t.Error("streaming capability must survive card regeneration")
 	}
 	if len(card.Signatures) != 0 {
 		t.Error("stale signatures must be dropped from the regenerated card")
@@ -190,6 +204,31 @@ func TestA2ACUJ(t *testing.T) {
 	}
 	if len(reply.Parts) == 0 || reply.Parts[0].Text() != "echo from eu" {
 		t.Fatalf("unexpected reply: %+v", reply)
+	}
+
+	// A first event must arrive while the backend is waiting for the client.
+	streamCtx, stopStream := context.WithTimeout(ctx, 3*time.Second)
+	defer stopStream()
+	gotTask, gotFinal := false, false
+	for event, err := range euClient.SendStreamingMessage(streamCtx, &a2a.SendMessageRequest{
+		Message: a2a.NewMessage(a2a.MessageRoleUser, a2a.NewTextPart("stream")),
+	}) {
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		switch event := event.(type) {
+		case *a2a.Task:
+			if gotTask {
+				t.Fatal("duplicate initial task")
+			}
+			gotTask = true
+			releaseStream <- struct{}{}
+		case *a2a.TaskStatusUpdateEvent:
+			gotFinal = event.Status.State == a2a.TaskStateCompleted && event.Status.Message.Parts[0].Text() == "stream finished"
+		}
+	}
+	if !gotTask || !gotFinal {
+		t.Fatalf("missing stream events: task=%v final=%v", gotTask, gotFinal)
 	}
 
 	// CUJ step 3: a mismatched label refuses fail-closed BEFORE egress —
