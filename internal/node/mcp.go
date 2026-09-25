@@ -50,6 +50,8 @@ Node diagnostics (logs, connectivity, network/token info, connecting to a peer b
 
 Tools on remote services are identified via the format 'scheme://service-name/tool-name' (where 'scheme://service-name' represents the well-known local address of the service, and 'tool-name' is the individual tool to execute on it. Tool names themselves can contain any characters).
 
+A2A agents (type 'a2a') are NOT called via call_remote_tool either: use discover_remote_services with type 'a2a' to find them, get_agent_card to see what an agent does, send_agent_task to message it (reuse the returned context_id for follow-ups), and get_agent_task to poll a task that has not finished.
+
 Inference services ('inference://...') are NOT called via call_remote_tool — they are plain OpenAI-compatible HTTP endpoints. Use discover_remote_services with type 'inference' to get each one's local_proxy_url, then send a normal HTTP request (e.g. POST <local_proxy_url>/chat/completions) directly to that URL.
 
 To authenticate such an HTTP request to this node, try these in order:
@@ -100,6 +102,23 @@ func NewMCPServer(node *SamNode) *mcp.Server {
 		Name:        "describe_remote_tool",
 		Description: "Return the description, input schema, and output schema for a specific aggregated tool on a specific peer. peer_id and tool_name are both required; tool_name must be a namespaced 'scheme://service/tool' name as returned by find_remote_tools.",
 	}, node.handleDescribeRemoteTool)
+
+	// A2A agents, ported from cmd/sam-a2a-bridge so no separate binary is
+	// needed to talk to them from an MCP client of this node.
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_agent_card",
+		Description: "Fetch the agent card of an A2A agent on the mesh (name, description, skills with examples, input/output modes), rewritten so its interface URL points at this node. Use after discover_remote_services with type 'a2a' to learn what an agent can do before sending it a task.",
+	}, node.handleGetAgentCard)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "send_agent_task",
+		Description: "Send a plain-text message to an A2A agent on the mesh (found via discover_remote_services with type 'a2a'; NOT via call_remote_tool). Returns {reply, context_id, task_id, state}: reply is the agent's text; state is 'message' for a direct answer or a TASK_STATE_* value. Pass the returned context_id on follow-up messages to continue the same conversation, and task_id to reply into a task in TASK_STATE_INPUT_REQUIRED. Poll a non-terminal task with get_agent_task. required_labels makes this node refuse fail-closed unless the provider attested them.",
+	}, node.handleSendAgentTask)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name:        "get_agent_task",
+		Description: "Fetch the current A2A task (status, history, artifacts) for a task_id previously returned by send_agent_task, e.g. to poll a task whose state was TASK_STATE_SUBMITTED or TASK_STATE_WORKING.",
+	}, node.handleGetAgentTask)
 
 	return mcpServer
 }

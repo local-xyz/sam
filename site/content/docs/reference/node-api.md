@@ -175,7 +175,7 @@ Over TCP, add `-H "X-Sam-Authentication: Bearer $TOKEN"` and use
 
 An A2A client starts from the agent card. Fetched through the proxy path,
 the card comes back regenerated: its interface URL is the proxy path
-itself, so a stock client sends `message/send` there without changes:
+itself, so a stock client sends `SendMessage` there without changes:
 
 ```bash
 curl -s --unix-socket $SOCK \

@@ -206,6 +206,23 @@ Use `call_remote_tool` with:
 
 `arguments` must be a JSON object, not a string containing JSON.
 
+A2A agents (`discover_remote_services` with `{"type":"a2a"}`) are not MCP
+servers and are never invoked with `call_remote_tool`; the node exposes three
+tools for them instead:
+
+- `get_agent_card` with `{"peer_id":"...","service":"..."}` returns the
+  agent's card (skills, examples, input/output modes) so you can tell what it
+  does before sending it anything.
+- `send_agent_task` with `{"peer_id":"...","service":"...","message":"..."}`
+  sends one text message and returns `{"reply","context_id","task_id","state"}`;
+  pass the returned `context_id` on follow-up messages to continue the same
+  conversation, `task_id` to answer a task in `TASK_STATE_INPUT_REQUIRED`, and
+  `required_labels` (`k=v,k=v`) to fail closed unless the provider attested
+  them.
+- `get_agent_task` with `{"peer_id":"...","service":"...","task_id":"..."}`
+  fetches a task's current status and artifacts, for polling a task whose
+  `state` was not yet terminal.
+
 ## Use Mesh Inference
 
 The mesh also carries `inference://` services: OpenAI-compatible model
